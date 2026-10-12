@@ -4,6 +4,8 @@ import { liveQuery } from 'dexie';
 import { db, initialConsent, type Consent, type AIJob } from '../storage/db';
 import { AgentDefinition as DefinitionSchema, DefinitionInput, WorkflowSummary, type AgentDefinition, type Episode, type Feedback, type ObservedEvent, type Workflow } from '../../../../packages/core/src/schemas';
 import { markdown } from '../../../../packages/core/src/definitions';
+import { JEV_THRESHOLDS } from '../../../../packages/core/src/jev';
+import type { JevStatus } from '../jev';
 import { backend, cancelJobs, command, recoverJobs } from './api';
 import './style.css';
 
@@ -20,7 +22,11 @@ function App() {
   const [settings, setSettings] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState<{ origin: string | null; collecting: boolean }>({ origin: null, collecting: false });
+  const [status, setStatus] = useState<{ origin: string | null; collecting: boolean; contentActive?: boolean; jev?: JevStatus }>({ origin: null, collecting: false });
+  const [jevEnabled, setJevEnabled] = useState(true);
+  const [contentSites, setContentSites] = useState<string[]>([]);
+  const [contentAck, setContentAck] = useState(false);
+  const [describe, setDescribe] = useState<Record<string, string>>({});
   const [siteInput, setSiteInput] = useState('');
   const [pairing, setPairing] = useState('');
   const [health, setHealth] = useState('Not paired');
@@ -39,7 +45,7 @@ function App() {
     })).subscribe({ next: setMemory, error: e => setError(`Local memory unavailable: ${message(e)}`) });
     const refresh = () => { void command({ type: 'status' }).then(setStatus).catch(e => setError(message(e))); void recoverJobs(setError); };
     refresh(); const interval = setInterval(refresh, 2500);
-    void chrome.storage.local.get('pairingToken').then(c => { if (typeof c.pairingToken === 'string') { setPairing(c.pairingToken); setHealth('Token saved; check connection'); } });
+    void chrome.storage.local.get(['pairingToken', 'jevEnabled']).then(c => { if (typeof c.pairingToken === 'string') { setPairing(c.pairingToken); setHealth('Token saved; check connection'); } setJevEnabled(c.jevEnabled !== false); });
     return () => { sub.unsubscribe(); clearInterval(interval); };
   }, []);
   const run = async (fn: () => Promise<unknown>) => {
@@ -115,38 +121,59 @@ function App() {
           if (!/^[a-f0-9]{64}$/.test(pairing.trim())) throw new Error('Expected the 64-character backend pairing token.');
           if (!await chrome.permissions.request({ origins: ['http://127.0.0.1/*'] })) throw new Error('Backend permission denied');
           await chrome.storage.local.set({ pairingToken: pairing.trim() });
-          const result = await backend('/health'); setHealth(result.configured ? `Live OpenAI ready · ${result.model}` : 'Connected · live AI disabled until server configuration is complete');
+          const result = await backend('/health');
+          setHealth(`${result.configured ? `Live OpenAI ready · ${result.model}` : 'Connected · OpenAI disabled until server configuration is complete'} · ${result.jev?.configured ? `Jev ready · ${result.jev.model}` : 'Jev disabled until TYPESAFE_API_KEY is set'}`);
         })}>Pair & check</button><button onClick={() => run(async () => { await chrome.storage.local.remove('pairingToken'); setPairing(''); setHealth('Not paired'); })}>Forget token</button></div><p className="note">{health}</p>
+        <h3>Jev live decisions · TypeSafe</h3><p className="muted">While recording, minimized and redacted episode data goes through your loopback backend to TypeSafe's Jev. Jev classifies unclear clicks, drops boilerplate and likely-sensitive captured text, suggests when a task looks finished, and decides which pattern an episode belongs to. Local rules decide whenever Jev is off or unavailable.</p>
+        <p className="note">Status: {status.jev ? `${status.jev.state} · ${status.jev.detail}${status.jev.model ? ` · ${status.jev.model}` : ''}${status.jev.decisions ? ` · ${status.jev.decisions} decisions this session` : ''}` : 'unknown'}</p>
+        <label className="check"><input type="checkbox" checked={jevEnabled} onChange={e => { const next = e.target.checked; setJevEnabled(next); void chrome.storage.local.set({ jevEnabled: next }); }}/>Send recordings to Jev for live decisions</label>
         <h3>Retention & deletion</h3><label>Evidence retention <select value={memory.consent.retentionDays} onChange={e => send({ type: 'retention', days: Number(e.target.value) })}>{[1, 3, 7, 14, 30].map(d => <option key={d} value={d}>{d} days</option>)}</select></label>
         <p className="muted">10,000-event cap. Aging evidence invalidates dependent episodes, interpretations, and drafts. Backend results expire after 24 hours. OpenAI account retention is governed by your account terms, not local reset.</p>
         <label className="check"><input type="checkbox" checked={retainSites} onChange={e => setRetainSites(e.target.checked)}/>Keep site approvals after reset (observation remains paused)</label>
         <button className="danger" disabled={busy} onClick={() => run(reset)}>Pause & delete all local data</button>
       </section>}
       {tab === 'Activity' && <>
-        <section className="intro"><span className="eyebrow">01 / OBSERVE</span><h2>Evidence before assumptions.</h2><p>Only safe interaction categories. No field values, page text, full URLs, or background-tab activity.</p></section>
+        <section className="intro"><span className="eyebrow">01 / OBSERVE</span><h2>Evidence before assumptions.</h2><p>Safe interaction categories by default. Page text and field edits only during a content-aware session you start. Never full URLs or background-tab activity. While recording, minimized data is sent to Jev for live decisions unless you turn it off in Settings.</p></section>
         <section className="card"><div className="sectiontitle"><h3>This site</h3><span className={`pill ${currentApproved ? 'green' : ''}`}>{currentApproved ? 'Approved' : 'Not approved'}</span></div>
           <code className="break">{status.origin ?? 'Current site URL unavailable — enter its origin below'}</code>
           {!status.origin && <input placeholder="https://example.com" value={siteInput} onChange={e => setSiteInput(e.target.value)}/>}
           {!currentApproved && <button className="primary full" disabled={busy || (!status.origin && !siteInput)} onClick={() => run(approveSite)}>Approve this scheme & host</button>}
           <p className="muted">Declaring optional HTTP(S) capability does not grant access to every site. You choose each host.</p>
         </section>
+        <section className="card"><div className="sectiontitle"><h3>Content-aware recording</h3><span className={`pill ${memory.consent.contentSession ? 'green' : ''}`}>{memory.consent.contentSession ? `On until ${clock(memory.consent.contentSession.expiresAt)}` : 'Off'}</span></div>
+          {memory.consent.contentSession ? <>
+            <p className="muted">Recording visible page text and settled edits in supported text fields on {memory.consent.contentSession.siteIds.map(alias).join(', ')}. Password, payment, login, and one-time-code fields are skipped. An on-page badge shows while it's active.</p>
+            <button className="danger full" disabled={busy} onClick={() => send({ type: 'content.stop' })}>Stop content recording</button>
+          </> : <>
+            <p className="muted">Captures what's visible on the page and what you type into ordinary text fields, so patterns and Jev decisions reflect the actual work. Redaction is best effort. Sessions last one hour; captured text expires after 24 hours.</p>
+            {memory.consent.sites.length === 0 ? <p className="note">Approve a site first.</p> : memory.consent.sites.map(s => <label className="check" key={s.id}><input type="checkbox" checked={contentSites.includes(s.id)} onChange={e => setContentSites(ids => e.target.checked ? [...ids, s.id] : ids.filter(id => id !== s.id))}/>{s.alias} <code>{s.origin}</code></label>)}
+            <label className="check"><input type="checkbox" checked={contentAck} onChange={e => setContentAck(e.target.checked)}/>I understand page text and my field edits on these sites will be stored locally and may be sent to Jev and, after my approval, OpenAI.</label>
+            <button className="primary full" disabled={busy || !contentAck || !contentSites.some(id => memory.consent.sites.some(s => s.id === id))} onClick={() => run(async () => { await command({ type: 'content.start', siteIds: contentSites.filter(id => memory.consent.sites.some(s => s.id === id)), acknowledged: true }); setContentAck(false); })}>Start one-hour content session</button>
+          </>}
+        </section>
         <div className="metrics"><div><b>{memory.events.length >= 100 ? '100+' : memory.events.length}</b><span>recent events</span></div><div><b>{completed}</b><span>completed episodes</span></div><div><b>{memory.consent.sites.length}</b><span>approved origins</span></div></div>
         <section className="card"><div className="sectiontitle"><h3>Episode boundaries</h3><button disabled={busy || !memory.episodes.some(e => !e.closed)} onClick={() => send({ type: 'episode.end' })}>End episode</button></div><p className="muted">Mark each task complete. Cross-tab activity on approved apps can stay together; idle, unobserved intervals, pause, and loss of browser focus split it.</p>
           {!memory.episodes.length && <Empty title="Your first episode starts here" text="Approve a site, start observation, and use ordinary buttons or forms. Then mark the episode complete."/>}
-          {memory.episodes.slice(0, 20).map(e => <div className="episode" key={e.id}><div className="row"><button className="textbutton" onClick={() => setExpanded(expanded === e.id ? null : e.id)}>{e.closed ? '◇' : '●'} {clock(e.start)} · {e.eventIds.length} events</button><span className="muted">≈ {duration(e.activeMs)}</span></div><p className="note">{e.closed ? e.reason : 'Recording · not yet counted as an occurrence'}</p>
-            {expanded === e.id && <><TokenList tokens={e.tokens} alias={alias}/>{e.gaps.length > 0 && <p className="note">Gaps: {e.gaps.join('; ')}</p>}<button className="danger" onClick={() => run(async () => {
+          {memory.episodes.slice(0, 20).map(e => {
+            const grouped = memory.workflows.some(w => w.occurrenceIds.includes(e.id));
+            const suggestion = !e.closed && e.boundarySuggestion && e.boundarySuggestion.probability >= JEV_THRESHOLDS.finished && e.eventIds.length - e.boundarySuggestion.eventCount <= 2 ? e.boundarySuggestion : null;
+            return <div className="episode" key={e.id}><div className="row"><button className="textbutton" onClick={() => setExpanded(expanded === e.id ? null : e.id)}>{e.closed ? '◇' : '●'} {clock(e.start)} · {e.eventIds.length} events</button><span className="muted">≈ {duration(e.activeMs)}</span></div><p className="note">{e.closed ? `${e.reason}${e.grouping === 'pending' ? ' · matching…' : ''}` : 'Recording · not yet counted as an occurrence'}</p>
+            {suggestion && <div className="notice">Jev: this task looks finished ({Math.round(suggestion.probability * 100)}%). <button disabled={busy} onClick={() => send({ type: 'episode.end' })}>End episode</button></div>}
+            {expanded === e.id && <><TokenList tokens={e.tokens} alias={alias}/>{e.gaps.length > 0 && <p className="note">Gaps: {e.gaps.join('; ')}</p>}
+            {e.closed && !grouped && e.grouping !== 'pending' && <div className="row"><input maxLength={1200} placeholder="Describe this task to keep it as a pattern…" value={describe[e.id] ?? ''} onChange={v => setDescribe(d => ({ ...d, [e.id]: v.target.value }))}/><button disabled={busy || !describe[e.id]?.trim()} onClick={() => run(async () => { await command({ type: 'episode.describe', id: e.id, intent: describe[e.id].trim() }); setDescribe(d => ({ ...d, [e.id]: '' })); })}>Save</button></div>}
+            <button className="danger" onClick={() => run(async () => {
               if (!window.confirm('Delete this episode and invalidate dependent drafts and analysis?')) return;
               const jobs = memory.jobs;
               await command({ type: 'episode.delete', id: e.id }); void cancelJobs(jobs.filter(j => memory.workflows.some(w => w.id === j.workflowId && w.occurrenceIds.includes(e.id))));
             })}>Delete episode evidence</button></>}
-          </div>)}
+          </div>; })}
         </section>
         <section className="card"><div className="sectiontitle"><h3>Recorded timeline</h3><span className="pill">OBSERVED</span></div><p className="muted">Latest 100 minimized events, newest first. Submit means an attempt, not success.</p>
           {memory.events.length === 0 ? <p className="muted">No observations stored.</p> : <div className="timeline">{memory.events.map(e => <div className="event" key={e.id}><time>{clock(e.time)}</time><div><strong>{alias(e.siteId)}</strong><p>{e.category}{e.action !== 'unknown' ? ` · ${e.action}` : ''}</p></div><span title="Observed">↳</span></div>)}</div>}
         </section>
       </>}
       {tab === 'Patterns' && <>
-        <section className="intro"><span className="eyebrow">02 / RECOGNIZE & CONFIRM</span><h2>Repetition, not certainty.</h2><p>Local sequence matching finds candidates. Hosted interpretation happens only after you review the exact summary.</p></section>
+        <section className="intro"><span className="eyebrow">02 / RECOGNIZE & CONFIRM</span><h2>Repetition, not certainty.</h2><p>Jev decides which episodes are the same task, choosing from patterns shortlisted by local matching; local rules decide when Jev is unavailable. OpenAI interpretation happens only after you review the exact summary.</p></section>
         {!memory.workflows.length && <Empty title="Let the evidence accumulate" text="Complete three similar episodes to enable hosted analysis. Two meaningful safe actions are needed; site order alone never establishes a pattern."/>}
         {memory.workflows.length > 0 && <p className="muted">Priority: occurrences × mean approximate active time ÷ (1 + known capture gaps). Feasibility is not confirmed and capabilities remain unverified.</p>}
         {ranked.map(w => {
@@ -162,8 +189,8 @@ function App() {
             <div className="sectiontitle"><span className="eyebrow">{suppressed ? 'DISMISSED' : occurrences.length >= 3 ? 'READY FOR REVIEW' : occurrences.length === 2 ? 'EMERGING PATTERN' : 'CANDIDATE'}</span><span className="pill">{occurrences.length} occurrences</span></div>
             <h3>{intent?.text ?? w.interpretation?.result.name ?? 'Repeated interaction sequence'}</h3>
             <p className="note">{intent ? 'USER-CONFIRMED INTENT' : w.interpretation ? 'INFERRED · hosted OpenAI' : 'LOCAL HEURISTIC · purpose unknown'}</p>
-            <div className="facts"><span>≈ {duration(mean)} active / occurrence</span><span>Last match {Math.round(w.score * 100)} / 100</span></div>
-            <p className="muted">Timing is approximate; match scores are not probabilities. Evidence spans {occurrences.length ? Math.max(0, (Math.max(...occurrences.map(e => e.end)) - Math.min(...occurrences.map(e => e.start))) / 86400000).toFixed(2) : '0'} days. No weekly projection.</p>
+            <div className="facts"><span>≈ {duration(mean)} active / occurrence</span><span>Last match {w.matchedBy === 'jev' ? `Jev ${Math.round(w.score * 100)}%` : `local ${Math.round(w.score * 100)} / 100`}</span></div>
+            <p className="muted">Timing is approximate. Jev match percentages are calibrated probabilities; local scores are not. Evidence spans {occurrences.length ? Math.max(0, (Math.max(...occurrences.map(e => e.end)) - Math.min(...occurrences.map(e => e.start))) / 86400000).toFixed(2) : '0'} days. No weekly projection.</p>
             {w.interpretation && <div className="interpretation"><p>{w.interpretation.result.purpose}</p><p className="note">Interpretation v{w.interpretation.version} · based on {w.interpretation.occurrenceCount} occurrences, feedback v{w.interpretation.feedbackVersion}. {(w.interpretation.occurrenceCount !== occurrences.length || w.interpretation.feedbackVersion !== w.feedbackVersion) ? 'OUTDATED — new evidence/corrections need fresh approval.' : 'Inferred business intent requires your review.'}</p>
               {w.interpretation.result.claims.map((c, i) => <div className="claim" key={i}><span className="pill">{c.source}</span><p>{c.statement}</p><small>{c.uncertainty} · evidence {c.evidenceRefs.map(r => r.slice(0, 8)).join(', ')}</small></div>)}
               <details><summary>Alternatives, boundary & blockers</summary><p>{w.interpretation.result.alternatives.join('; ') || 'No alternatives proposed.'}</p><p>{w.interpretation.result.automationBoundary}</p><p>{w.interpretation.result.feasibility}</p><ul>{w.interpretation.result.blockers.map((q, i) => <li key={i}>{q}</li>)}</ul><h4>Unresolved questions</h4><ul>{w.interpretation.result.questions.map((q, i) => <li key={i}>{q}</li>)}</ul></details>
@@ -191,10 +218,10 @@ function App() {
           <p className="muted">No verified connector, browser replay, execution, or deployment. Local evidence references do not travel with the export.</p>
         </section>)}
       </>}
-      <footer>Observed ≠ inferred ≠ user-confirmed.<br/>Local matching never uploads your activity.</footer>
+      <footer>Observed ≠ inferred ≠ user-confirmed.<br/>Jev sees minimized recordings for live decisions; OpenAI sees only summaries you approve.</footer>
     </main>
     {share && <Modal error={error} title={share.kind === 'analysis' ? 'Review hosted interpretation request' : 'Review hosted definition request'} close={() => setShare(null)}>
-      <p>Only the exact JSON below will be sent to your loopback backend, then OpenAI. Raw events and approved hosts are excluded. User-entered aliases and corrections may still be sensitive.</p><div className="notice">No request has been sent. Redact aliases or correction wording below. Factual fields cannot be edited. OpenAI retention depends on your approved account terms.</div>
+      <p>Only the exact JSON below will be sent to your loopback backend, then OpenAI. Raw events and approved hosts are excluded. Captured page excerpts and field edits, aliases, and corrections may still be sensitive; redact their wording below.</p><div className="notice">No request has been sent. Redact aliases or correction wording below. Factual fields cannot be edited. OpenAI retention depends on your approved account terms.</div>
       <textarea className="json" spellCheck={false} value={share.text} onChange={e => setShare({ ...share, text: e.target.value })}/>
       <p className="muted">Every change requires a new approval. Your click approves this exact version only.</p>
       <button className="primary full" disabled={busy} onClick={() => run(async () => {

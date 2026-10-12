@@ -21,6 +21,14 @@ The demo serves ordinary HTML at `http://127.0.0.1:4401` and `http://localhost:4
 7. Perform an unrelated sequence, such as **Next**, **Close**, **Back** in the queue, and end the episode. Verify it does not join the earlier pattern. Ordinary buttons may have no application effect; the purpose is to demonstrate recorded UI evidence honestly.
 8. Inspect timeline and occurrence variants. A candidate's count is only completed, distinct grouped episodes. Approximate active time is event-derived and may be very short for staged clicks.
 
+## Content-aware and Jev path
+
+1. Add `TYPESAFE_API_KEY` and `JEV_MAX_DAILY_TOKENS` to `apps/backend/.env`, start the backend, and pair. Settings should show *Jev ready*.
+2. In Activity, select both demo apps under **Content-aware recording**, acknowledge, and start the session. Confirm the on-page badge and the `TXT` toolbar badge.
+3. Repeat the request-queue task three times, typing a short synthetic note in a text field each time. After **Save** or **Reply**, a *looks finished* suggestion may appear; confirm with **End episode**.
+4. Check that the episodes group with `Jev NN%` in Patterns, and that an unrelated sequence stays separate.
+5. Turn Jev off in Settings, record one more episode, and confirm grouping falls back to `local`.
+
 ## Hosted interpretation path
 
 1. Configure/pair the loopback backend as in README. A real approved model, credentials, prices, limits, and account terms are required. No fixture response is available.

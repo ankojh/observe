@@ -12,7 +12,19 @@
 - Generated the sanitized JSON/Markdown documentation samples from the same core definition builder/schema. They are clearly labeled documentation examples, not recorded observations or live AI results.
 - Inspected the built artifact file list and Git ignore rules. Pairing token/SQLite data, real `.env`, node_modules, dist, and ZIP are excluded from Git.
 
-Initial typechecking exposed incorrect relative imports; those were fixed before the successful builds. Node 22's `node:sqlite` experimental warning is expected. No automated tests were added or executed, by explicit owner request. No commits or pushes were made.
+### Jev and content-aware update (2026-10-11)
+
+- `npm run typecheck` and `npm run build`: passed.
+- Offline shape check: each Jev request kind produces the documented `systemone` question shapes, and `decode` parses documented example answers (choice → action, nouls → relevance, choice → pattern ID or new task). This check caught and fixed a decision-schema bug. It used no network.
+- Backend started on loopback with the real `.env` but no TypeSafe key: unauthenticated `POST /jev` → **401**; authenticated `/health` → `jev.configured:false`; authenticated `POST /jev` → **503** "Jev disabled". Stopped afterwards. No OpenAI or Jev call was made.
+- **Live Jev via the backend `/jev` route** (`jev-latest` → `jev-1.13.0`), 10 synthetic requests, 80–230 ms each, 5,811 input tokens in total:
+  - action: "Archive conversation" → `delete` 0.99; "Submit for approval" → `save` 0.78; "⋯" → `unknown` 0.84.
+  - relevance: invoice excerpt → relevant 0.93 / sensitive 0.02; navigation and cookie boilerplate → relevant 0.06 (dropped); medical note → sensitive 0.98 (dropped).
+  - boundary: after save and submit → 0.63 (**below the 0.7 suggestion threshold**); mid-task → 0.10.
+  - match: invoice episode against [support, invoice] → the invoice pattern at 1.0; support episode against [invoice] → new task at 0.99.
+- Synthetic API checks only; the extension hasn't yet made these calls from Chrome, and thresholds aren't tuned on real use.
+
+Initial typechecking exposed incorrect relative imports; those were fixed before the successful builds. Node 22's `node:sqlite` experimental warning is expected. No automated tests were added or executed, by explicit owner request.
 
 ## Not performed — do not call these passed
 
@@ -22,6 +34,8 @@ Initial typechecking exposed incorrect relative imports; those were fixed before
 - Pause/revoke/reset races in Chrome, including an in-flight inference.
 - Real live OpenAI account/model call, actual strict-output compatibility, provider cost/terms verification, and hosted end-to-end acceptance.
 - Two successful clean-profile reset-to-record-to-live-analysis-to-correction-to-export runs.
+- Any real Jev call, Jev decision quality, or threshold tuning.
+- Content-aware recording in Chrome: badge, field skipping, redaction, 24-hour expiry.
 
 The code/build is delivered; these manual acceptance checks remain necessary. Model, credentials, current prices, authorized USD caps, and approved account terms have not been supplied. The live feature is deliberately unavailable until configured rather than silently spending or using a fake provider.
 
@@ -51,6 +65,15 @@ Use the synthetic pages and instructions in `demo.md`.
 - [ ] Delete while a job runs; no late response repopulates local data. Best-effort cancellation and provider retention limits are disclosed.
 - [ ] Retention invalidates affected episode/workflow claims and drafts; quota errors block capture or visibly report when durable pause cannot be persisted.
 - [ ] Repeat the full reset-to-export demonstration twice, explicitly identifying live AI versus manual drafting.
+- [ ] Content-aware session: start requires site selection and acknowledgment; on-page badge and `TXT` badge appear; session ends on Stop, pause, one-hour expiry, and browser restart.
+- [ ] Password, email-type, payment, login, OTP, and fields in password forms are never captured; canary secrets in visible text are redacted or dropped.
+- [ ] Jev on: an unknown-label control (e.g. "Archive conversation") is stored with a Jev action; Settings shows `ready`, the model, and a decision count.
+- [ ] Jev drops boilerplate and canary-sensitive content records; relevant ones are stored with a relevance value.
+- [ ] Jev boundary suggestion appears after a save/send/submit and disappears after further activity; it never closes an episode itself.
+- [ ] Jev groups three related content episodes that local rules would miss, and keeps an unrelated one separate; patterns show `Jev NN%`.
+- [ ] Jev off in Settings, backend stopped, or no key: capture continues, the status explains why, and grouping falls back to `local`.
+- [ ] Pause during an in-flight Jev call: the event is not stored.
+- [ ] Captured content in the OpenAI sharing preview can be redacted; factual fields cannot.
 
 ## Known MVP constraints
 

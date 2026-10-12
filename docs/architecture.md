@@ -6,14 +6,16 @@
 - Chrome MV3 extension; the primary interface is a Chrome side panel, not a standalone website.
 - Vite/React for the panel, esbuild for worker/content bundles, TypeScript, Dexie/IndexedDB, Zod. This keeps the suggested component boundaries without adding a monorepo framework.
 - OpenAI via an authenticated Node/Express loopback backend, SQLite from Node's `node:sqlite` (experimental warning on Node 22 is expected). No deployment target or remote authentication is implemented.
+- TypeSafe's Jev (System One, `jev-latest`) makes live decisions while recording: action classification, content relevance, task-boundary suggestions, and same-task matching. OpenAI remains the only text generator (interpretations and definition drafts), behind explicit approval.
+- **Scope change from the builder handoff:** content-aware recording (visible page text and field edits) and automatic Jev calls during recording are owner-approved additions. The handoff listed field values and page text as out of scope; see [privacy](privacy.md) for the safeguards.
 - Provider model, credentials, terms, and cost limits are setup requirements, not silently selected defaults.
 - Tests deferred by owner; build/type checks are not privacy/browser acceptance.
 
 ## Data flow
 
-Approved page → isolated-world content script → serialized worker gate → IndexedDB → pure local sequence grouping → exact side-panel sharing preview → paired loopback API → OpenAI structured output → schema/grounding validation → persistent interpretation/corrections → portable draft → explicit reviewed file export.
+Approved page → isolated-world content script → worker consent gate → Jev action/relevance decision (per-document order) → serialized worker commit → IndexedDB → Jev-or-local grouping lane → exact side-panel sharing preview → paired loopback API → OpenAI structured output → schema/grounding validation → persistent interpretation/corrections → portable draft → explicit reviewed file export.
 
-Core logic imports no Chrome, DOM, or provider APIs. Only backend provider code contacts OpenAI. Content scripts cannot invoke a backend, change consent, or access pairing storage. All model strings render as text, not HTML. No generated code runs.
+Core logic imports no Chrome, DOM, or provider APIs. Only backend code contacts OpenAI or TypeSafe; the extension reaches Jev only through the paired loopback `/jev` route. Content scripts cannot invoke a backend, change consent, or access pairing storage. All model strings render as text, not HTML. No generated code runs.
 
 ## Capture and lifecycle
 
@@ -39,11 +41,20 @@ Write failure blocks capture, saves an emergency gate in trusted Chrome storage 
 
 A foreground stream can cross approved apps/tabs. Timing breaks are persisted on tab/window transitions to avoid attributing known hidden time even if the intervening app produces no event. No time is accumulated across tabs; same-tab event intervals are capped at 30 seconds. Idle over two minutes, explicit boundaries, pause, unobserved intervals, browser restart, and 120-event bounds close episodes. Timing remains approximate and may undercount work.
 
-Episodes are non-overlapping. Completed episodes with at least two meaningful safe control/submit actions are eligible for deterministic grouping; unknown/navigation-only activity is insufficient. Weighted normalized edit distance compares at most 120 tokens per pair (O(120²)); meaningful actions weigh 1.5, navigation 0.6, unknowns 0.35. Threshold 0.76 is a heuristic. Matches must also share meaningful actions; app order alone cannot establish a pattern. A representative episode anchors each group and variants remain inspectable. This is conservative, not general process mining.
+Episodes are non-overlapping. Jev decides grouping when available (see Jev decisions); the rules below are the shortlist and fallback. Completed episodes with at least two meaningful safe control/submit actions, or enough captured content, are eligible for deterministic grouping; unknown/navigation-only activity is insufficient. Weighted normalized edit distance compares at most 120 tokens per pair (O(120²)); meaningful actions weigh 1.5, navigation 0.6, unknowns 0.35. Threshold 0.76 is a heuristic. Matches must also share meaningful actions; app order alone cannot establish a pattern. A representative episode anchors each group and variants remain inspectable. This is conservative, not general process mining.
 
 One occurrence is a candidate; two are emerging; three allow an analysis recommendation. No weekly frequency is inferred. Cards show occurrence count, timespan, approximate mean active time, last similarity score, and feasibility/blockers after interpretation. Priority is explicitly occurrences × mean approximate active time ÷ (1 + known capture gaps), with repetition as a tie-breaker; confirmed feasibility is not invented. Savings default to zero: manual time minus user-assumed remaining human review. No claimed connector availability or ROI.
 
 Corrections are scoped to a workflow, persisted as versioned feedback, and included in later summaries and definitions for matched occurrences. Corrected rules retain superseded provenance but only current rules are applied. Exclusion removes an occurrence from counts while preserving inspectable activity. Dismissals suppress recommendations until restoration or three new occurrences. Corrections/exclusion invalidate drafts rather than overwrite human edits. Original interpretations retain up to ten archived versions with their evidence count, correction version, digest, and source text. Evidence deletion invalidates dependent archives; they are never displayed as current claims.
+
+## Jev decisions
+
+`packages/core/src/jev.ts` defines the request/decision contract, thresholds, and episode briefs; `apps/backend/src/jev.ts` holds the fixed question templates and the HTTP client; `apps/extension/src/jev.ts` is the worker client.
+
+- **Capture path.** Capture messages are routed through a per-document promise chain. `prepare` redacts, checks the read-only consent gate, and only then calls Jev: a Choice over the action enum for unknown clicks with a hint, or two Nouls (relevant, sensitive) for content records. `ingest` then re-checks the gate inside the serialized writer lane and commits. Sequence order within a document is preserved; ordering across documents may shift by the Jev latency.
+- **Grouping.** Closing an episode marks it `grouping: 'pending'` and schedules a separate grouping lane. For each pending episode, local `localScore` shortlists up to eight patterns, Jev chooses one of them or `new_task`, and the result commits back through the writer lane, re-checking that the episode still exists and is unassigned. A decision below 0.5, no shortlist, or an unavailable Jev falls back to the original deterministic `groupEpisode`. Navigation-only episodes never form a pattern either way. Pending grouping resumes on worker start.
+- **Boundaries.** After a submit or a save/send/reply/delete/add action, a Noul asks whether the task looks finished. The probability is stored on the open episode; the panel shows a suggestion at ≥ 0.7 until two more events arrive. Episodes are never closed by Jev.
+- **Failure.** 4 s client timeout, one backend retry on 429/529, 60 s backoff when the backend reports Jev disabled or unauthorized, 5 s after other failures. Every failure falls back to local rules.
 
 ## AI jobs and grounding
 
@@ -53,6 +64,7 @@ API routes (our application endpoints):
 - `POST /analysis-jobs` or `/definition-jobs`: strict `{requestId, kind, payload, approval:true}`.
 - `GET /jobs/:id`: authenticated status/result for either kind.
 - `DELETE /jobs/:id`: best-effort cancel and erase backend result.
+- `POST /jev`: synchronous Jev decision for a typed `JevRequest` (`action`, `relevance`, `boundary`, `match`). 240 requests/minute locally and a required `JEV_MAX_DAILY_TOKENS` input-token cap. Only daily token totals are persisted.
 
 All routes require bearer pairing authentication, exact loopback Host, and configured extension Origin when present. CORS allows only that origin; it is not authentication. Request limit 48 KiB, six new jobs/minute, at most six accepted concurrent/queued jobs, two provider calls at once, 60-second provider timeout, ten-second panel fetch timeout. Idempotency checks precede charging/rate controls. Reusing an ID with another payload is rejected. No automatic charged retries.
 

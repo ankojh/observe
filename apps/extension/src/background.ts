@@ -1,9 +1,11 @@
 import { z } from 'zod';
-import { AgentDefinition, ContentData, ContentPayload, DefinitionDraft, DefinitionInput, EventPayload, Interpretation, WorkflowSummary, validateDraftGrounding, validateGrounding, type Episode, type ObservedEvent, type ContentRecord } from '../../../packages/core/src/schemas';
-import { buildSummary, groupEpisode, LIMITS, token } from '../../../packages/core/src/learning';
+import { AgentDefinition, ContentData, ContentPayload, DefinitionDraft, DefinitionInput, EventPayload, Interpretation, WorkflowSummary, validateDraftGrounding, validateGrounding, type Episode, type ObservedEvent, type ContentRecord, type Workflow } from '../../../packages/core/src/schemas';
+import { buildSummary, groupEpisode, LIMITS, localScore, meaningful, token } from '../../../packages/core/src/learning';
 import { makeDefinition } from '../../../packages/core/src/definitions';
 import { CONTENT_LIMITS, contentTerms, redactContent } from '../../../packages/core/src/privacy';
+import { describeToken, episodeBrief, JEV_LIMITS, JEV_THRESHOLDS } from '../../../packages/core/src/jev';
 import { db, state, hash, initialConsent, type Site, type AIJob } from './storage/db';
+import { jevDecide, jevStatus } from './jev';
 
 const BACKEND = 'http://127.0.0.1:4317';
 let lane = Promise.resolve();
@@ -11,6 +13,16 @@ let captureBlocked = true; // Fail closed until persistent settings have been in
 function serial<T>(fn: () => Promise<T>): Promise<T> {
   const task = lane.then(fn); lane = task.then(() => undefined, () => undefined); return task;
 }
+// Per-document ordering while Jev judges an event outside the writer lane, so sequence order is preserved.
+const documentLanes = new Map<string, Promise<unknown>>();
+function inDocumentOrder<T>(documentId: string, fn: () => Promise<T>): Promise<T> {
+  const task = (documentLanes.get(documentId) ?? Promise.resolve()).then(fn, fn);
+  const tail = task.catch(() => undefined);
+  documentLanes.set(documentId, tail);
+  void tail.then(() => { if (documentLanes.get(documentId) === tail) documentLanes.delete(documentId); });
+  return task;
+}
+const aliasOf = (sites: Site[]) => (id: string) => sites.find(s => s.id === id)?.alias ?? 'Removed app';
 const safeError = (e: unknown) => e instanceof Error ? e.message.slice(0, 300) : 'Operation failed';
 const trusted = (s: chrome.runtime.MessageSender) => s.id === chrome.runtime.id && s.url === chrome.runtime.getURL('index.html');
 async function siteFor(sender: chrome.runtime.MessageSender): Promise<Site | undefined> {
@@ -29,13 +41,65 @@ async function markTimingBreak() {
   if (open) await db.episodes.update(open.id, { timingBreak: true });
 }
 async function closeEpisode(reason: string, gap = false) {
-  await db.transaction('rw', [db.episodes, db.workflows], async () => {
+  const closed = await db.transaction('rw', [db.episodes], async () => {
     const open = (await db.episodes.toArray()).find(e => !e.closed);
-    if (!open) return;
-    const completed = { ...open, closed: true, reason, gaps: gap ? [...open.gaps, reason] : open.gaps };
-    await db.episodes.put(completed);
-    const grouped = groupEpisode(completed, await db.workflows.toArray(), await db.episodes.toArray());
-    if (grouped) await db.workflows.put(grouped);
+    if (!open) return false;
+    await db.episodes.put({ ...open, closed: true, reason, gaps: gap ? [...open.gaps, reason] : open.gaps, grouping: 'pending' });
+    return true;
+  });
+  // Grouping may wait on Jev, so it runs outside the writer lane and commits back through it.
+  if (closed) scheduleGrouping();
+}
+let groupLane: Promise<void> = Promise.resolve();
+function scheduleGrouping() { groupLane = groupLane.then(groupPending).catch(() => undefined); }
+async function groupPending() {
+  const pending = (await db.episodes.toArray()).filter(e => e.closed && e.grouping === 'pending').sort((a, b) => a.start - b.start);
+  for (const episode of pending) {
+    const decision = await matchDecision(episode);
+    await serial(() => db.transaction('rw', [db.episodes, db.workflows], async () => {
+      const current = await db.episodes.get(episode.id);
+      if (!current || current.grouping !== 'pending') return; // Deleted, reset, or already described.
+      const workflows = await db.workflows.toArray();
+      if (!workflows.some(w => w.occurrenceIds.includes(current.id))) {
+        let grouped: Workflow | null = null;
+        const target = decision?.candidateId ? workflows.find(w => w.id === decision.candidateId && !w.excludedIds.includes(current.id)) : undefined;
+        if (decision && target) grouped = { ...target, occurrenceIds: [...target.occurrenceIds, current.id], score: decision.probability, matchedBy: 'jev' };
+        else if (decision && !decision.candidateId) grouped = { id: crypto.randomUUID(), representativeId: current.id, occurrenceIds: [current.id], excludedIds: [], score: 1, feedbackVersion: 0, dismissedAtCount: null, matchedBy: 'jev' };
+        else grouped = groupEpisode(current, workflows, await db.episodes.toArray());
+        if (grouped) await db.workflows.put(grouped);
+      }
+      await db.episodes.update(current.id, { grouping: 'done' });
+    }));
+  }
+}
+/** Jev picks among locally shortlisted patterns. Null means use local grouping. Navigation-only episodes never form a pattern. */
+async function matchDecision(episode: Episode): Promise<{ candidateId: string | null; probability: number } | null> {
+  if (!meaningful(episode)) return null;
+  const [workflows, episodes, contexts, feedback, consent] = await Promise.all([db.workflows.toArray(), db.episodes.toArray(), db.contexts.toArray(), db.feedback.toArray(), state()]);
+  const byId = new Map(episodes.map(e => [e.id, e]));
+  const shortlist = workflows
+    .filter(w => !w.excludedIds.includes(episode.id) && !w.occurrenceIds.includes(episode.id) && byId.has(w.representativeId))
+    .map(w => ({ w, score: localScore(episode, byId.get(w.representativeId)!) }))
+    .sort((a, b) => b.score - a.score).slice(0, JEV_LIMITS.candidates);
+  if (!shortlist.length) return null;
+  const alias = aliasOf(consent.sites);
+  const purpose = (w: Workflow) => feedback.filter(f => f.workflowId === w.id && f.type === 'intent').sort((a, b) => b.version - a.version)[0]?.text ?? w.interpretation?.result.name ?? null;
+  const candidates = shortlist.map(({ w }) => ({ id: w.id, purpose: purpose(w), brief: episodeBrief(byId.get(w.representativeId)!, contexts, alias) }));
+  const request = { kind: 'match' as const, episode: episodeBrief(episode, contexts, alias), candidates };
+  // Stay under the backend's 48 KiB body limit by dropping the lowest-ranked candidates.
+  while (candidates.length > 1 && new TextEncoder().encode(JSON.stringify(request)).length > 44000) candidates.pop();
+  const decision = await jevDecide(request);
+  return decision && decision.probability >= JEV_THRESHOLDS.match ? { candidateId: decision.candidateId, probability: decision.probability } : null;
+}
+/** Suggestion only: the user still confirms with End episode. */
+async function suggestBoundary(episodeId: string) {
+  const episode = await db.episodes.get(episodeId); if (!episode || episode.closed) return;
+  const contexts = await db.contexts.where('episodeId').equals(episodeId).toArray();
+  const decision = await jevDecide({ kind: 'boundary', episode: episodeBrief(episode, contexts, aliasOf((await state()).sites)) });
+  if (!decision) return;
+  await serial(async () => {
+    const current = await db.episodes.get(episodeId); if (!current || current.closed) return;
+    await db.episodes.update(episodeId, { boundarySuggestion: { probability: decision.finished, eventCount: current.eventIds.length, time: Date.now() } });
   });
 }
 function contentConfig(consent: Awaited<ReturnType<typeof state>>, site?: Site) {
@@ -103,24 +167,57 @@ async function prune() {
     }
   });
 }
-async function ingest(sender: chrome.runtime.MessageSender, raw: unknown, enriched = false) {
-  const parsed = enriched ? ContentPayload.parse(raw) : EventPayload.parse(raw);
-  const consent = await state();
-  const payload = 'data' in parsed ? { id: parsed.id, document: parsed.document, sequence: parsed.sequence, epoch: parsed.epoch, visible: parsed.visible, category: parsed.data.kind, action: 'unknown' as const, role: parsed.data.kind === 'content.display' ? 'page' as const : 'unknown' as const } : parsed;
-  const site = await siteFor(sender);
-  if (captureBlocked || !site || !consent.enabled || payload.epoch !== consent.epoch) return { ok: false, disabled: true };
-  if (!await foreground(sender.tab!.id!)) return { ok: false, disabled: true };
-  if (!payload.visible && payload.category !== 'page.visibility_change') return { ok: false, disabled: true };
-  let data: ContentData | undefined;
-  if ('data' in parsed) {
-    const session = consent.contentSession;
-    if (!session || session.id !== parsed.sessionId || session.expiresAt <= Date.now() || !session.siteIds.includes(site.id)) return { ok: false, disabled: true };
-    const text = redactContent(parsed.data.text, CONTENT_LIMITS.excerptChars), after = redactContent(parsed.data.after, CONTENT_LIMITS.fieldChars);
-    const before = parsed.data.before === null ? null : redactContent(parsed.data.before, CONTENT_LIMITS.fieldChars);
-    const label = redactContent(parsed.data.label, CONTENT_LIMITS.labelChars);
-    data = ContentData.parse({ ...parsed.data, text: text.text, after: after.text, before: before?.text ?? null, label: label.text, redactions: parsed.data.redactions + text.redactions + after.redactions + (before?.redactions ?? 0) + label.redactions, truncated: parsed.data.truncated || text.truncated || after.truncated || (before?.truncated ?? false) });
-    if (data.kind === 'content.display' && !data.text.trim() || data.kind === 'field.edit' && data.before === data.after) return { ok: true };
+type Prepared =
+  | { kind: 'event'; payload: Omit<z.infer<typeof EventPayload>, 'hint'> }
+  | { kind: 'content'; parsed: z.infer<typeof ContentPayload>; data: ContentData; relevance: number | null }
+  | { kind: 'drop' };
+/** Read-only consent gate. Checked before any Jev call and again inside the writer lane before commit. */
+async function allowed(sender: chrome.runtime.MessageSender, epoch: number, visible: boolean, category: string): Promise<Site | undefined> {
+  const consent = await state(); const site = await siteFor(sender);
+  if (captureBlocked || !site || !consent.enabled || epoch !== consent.epoch) return;
+  if (!await foreground(sender.tab!.id!)) return;
+  if (!visible && category !== 'page.visibility_change') return;
+  return site;
+}
+async function recentActivity(): Promise<string[]> {
+  const open = (await db.episodes.toArray()).find(e => !e.closed); const alias = aliasOf((await state()).sites);
+  return (open?.tokens ?? []).slice(-10).map(t => describeToken(t, alias));
+}
+function activeSession(consent: Awaited<ReturnType<typeof state>>, site: Site, sessionId: string) {
+  const session = consent.contentSession;
+  return !!session && session.id === sessionId && session.expiresAt > Date.now() && session.siteIds.includes(site.id);
+}
+/** Redacts and, when allowed, asks Jev to classify unknown clicks and filter captured content. Runs outside the writer lane. */
+async function prepare(sender: chrome.runtime.MessageSender, raw: unknown, enriched: boolean): Promise<Prepared> {
+  if (!enriched) {
+    const { hint, ...payload } = EventPayload.parse(raw);
+    if (payload.category !== 'control.activate' || payload.action !== 'unknown' || !hint) return { kind: 'event', payload };
+    const label = redactContent(hint, JEV_LIMITS.hintChars).text.trim();
+    if (!label || !await allowed(sender, payload.epoch, payload.visible, payload.category)) return { kind: 'event', payload };
+    const decision = await jevDecide({ kind: 'action', control: { role: payload.role === 'link' ? 'link' : 'button', label }, recent: await recentActivity() });
+    return { kind: 'event', payload: decision && decision.action !== 'unknown' && decision.probability >= JEV_THRESHOLDS.action ? { ...payload, action: decision.action } : payload };
   }
+  const parsed = ContentPayload.parse(raw);
+  const text = redactContent(parsed.data.text, CONTENT_LIMITS.excerptChars), after = redactContent(parsed.data.after, CONTENT_LIMITS.fieldChars);
+  const before = parsed.data.before === null ? null : redactContent(parsed.data.before, CONTENT_LIMITS.fieldChars);
+  const label = redactContent(parsed.data.label, CONTENT_LIMITS.labelChars);
+  const data = ContentData.parse({ ...parsed.data, text: text.text, after: after.text, before: before?.text ?? null, label: label.text, redactions: parsed.data.redactions + text.redactions + after.redactions + (before?.redactions ?? 0) + label.redactions, truncated: parsed.data.truncated || text.truncated || after.truncated || (before?.truncated ?? false) });
+  if (data.kind === 'content.display' && !data.text.trim() || data.kind === 'field.edit' && data.before === data.after) return { kind: 'drop' };
+  const site = await allowed(sender, parsed.epoch, parsed.visible, data.kind);
+  if (!site || !activeSession(await state(), site, parsed.sessionId)) return { kind: 'content', parsed, data, relevance: null };
+  const decision = await jevDecide({ kind: 'relevance', recent: await recentActivity(), content: { kind: data.kind, label: data.label, text: data.text, before: data.before, after: data.after } });
+  // Boilerplate and likely-sensitive content is never stored when Jev can judge it.
+  if (decision && (decision.sensitive >= JEV_THRESHOLDS.sensitive || decision.relevant < JEV_THRESHOLDS.relevant)) return { kind: 'drop' };
+  return { kind: 'content', parsed, data, relevance: decision?.relevant ?? null };
+}
+async function ingest(sender: chrome.runtime.MessageSender, prepared: Prepared) {
+  if (prepared.kind === 'drop') return { ok: true };
+  const parsed = prepared.kind === 'content' ? prepared.parsed : null;
+  const payload = parsed ? { id: parsed.id, document: parsed.document, sequence: parsed.sequence, epoch: parsed.epoch, visible: parsed.visible, category: parsed.data.kind, action: 'unknown' as const, role: parsed.data.kind === 'content.display' ? 'page' as const : 'unknown' as const } : (prepared as Extract<Prepared, { kind: 'event' }>).payload;
+  const site = await allowed(sender, payload.epoch, payload.visible, payload.category);
+  if (!site) return { ok: false, disabled: true };
+  const data = prepared.kind === 'content' ? prepared.data : undefined;
+  if (parsed && !activeSession(await state(), site, parsed.sessionId)) return { ok: false, disabled: true };
   const time = Date.now(); // Never accept a page-provided timestamp.
   const event: ObservedEvent = { ...payload, time, siteId: site.id, tabId: sender.tab!.id!, ...(data ? { contextRef: payload.id } : {}) };
   if (await db.events.get(event.id) || await db.events.where('[document+sequence]').equals([event.document, event.sequence]).count()) return { ok: true };
@@ -128,10 +225,12 @@ async function ingest(sender: chrome.runtime.MessageSender, raw: unknown, enrich
   if (open && (time - open.end > LIMITS.inactivityMs || open.eventIds.length >= LIMITS.episodeEvents)) {
     await closeEpisode(time - open.end > LIMITS.inactivityMs ? 'Inactivity' : '120-event bound'); open = undefined;
   }
+  let episodeId: string | undefined;
   await db.transaction('rw', [db.events, db.episodes, db.contexts], async () => {
     await db.events.add(event);
     if (event.category === 'page.visibility_change' && !event.visible) return;
     const current: Episode = open ?? { id: crypto.randomUUID(), eventIds: [], tokens: [], start: time, end: time, activeMs: 0, closed: false, reason: 'Recording', gaps: [] };
+    episodeId = current.id;
     const previous = current.eventIds.length ? await db.events.get(current.eventIds[current.eventIds.length - 1]) : undefined;
     const sameForeground = !current.timingBreak && previous?.tabId === event.tabId && previous.visible;
     current.activeMs += sameForeground ? Math.min(LIMITS.intervalCapMs, Math.max(0, time - current.end)) : 0;
@@ -139,8 +238,8 @@ async function ingest(sender: chrome.runtime.MessageSender, raw: unknown, enrich
     current.end = time; current.eventIds.push(event.id);
     const nextToken = token(event);
     if (current.tokens[current.tokens.length - 1] !== nextToken || !!data || event.category === 'form.submit_attempt' || event.category === 'control.activate' && event.action !== 'unknown') current.tokens.push(nextToken);
-    if (data && 'sessionId' in parsed) {
-      const record: ContentRecord = { ...data, id: event.id, time, siteId: site.id, episodeId: current.id, document: event.document, sessionId: parsed.sessionId };
+    if (data && parsed) {
+      const record: ContentRecord = { ...data, id: event.id, time, siteId: site.id, episodeId: current.id, document: event.document, sessionId: parsed.sessionId, relevance: prepared.kind === 'content' ? prepared.relevance : null };
       await db.contexts.put(record);
       current.contentFeatures = [...(current.contentFeatures ?? []), { app: site.id, kind: data.kind, label: data.label, terms: contentTerms(data.kind === 'content.display' ? data.text : `${data.label} ${data.after}`), fieldType: data.fieldType }].slice(-120);
     }
@@ -148,6 +247,7 @@ async function ingest(sender: chrome.runtime.MessageSender, raw: unknown, enrich
     await db.episodes.put(current);
   });
   if (!event.visible) await closeEpisode('Page hidden');
+  else if (episodeId && (event.category === 'form.submit_attempt' || event.category === 'control.activate' && ['save', 'send', 'reply', 'delete', 'add'].includes(event.action))) void suggestBoundary(episodeId).catch(() => {});
   await prune();
   return { ok: true };
 }
@@ -189,7 +289,7 @@ async function panel(raw: unknown) {
       let origin: string | null = null; try { if (tab?.url?.startsWith('http')) origin = new URL(tab.url).origin; } catch { /* no URL */ }
       const approved = consent.sites.find(s => s.origin === origin);
       const collecting = !captureBlocked && consent.enabled && !!approved && tab?.id !== undefined && await foreground(tab.id) && await chrome.permissions.contains({ origins: [approved.pattern] });
-      return { consent: captureBlocked ? { ...consent, error: consent.error ?? 'Capture blocked after a storage failure. Reset, or explicitly start after resolving local storage.' } : consent, origin, collecting, contentActive: collecting && !!contentConfig(consent, approved), backend: BACKEND };
+      return { consent: captureBlocked ? { ...consent, error: consent.error ?? 'Capture blocked after a storage failure. Reset, or explicitly start after resolving local storage.' } : consent, origin, collecting, contentActive: collecting && !!contentConfig(consent, approved), backend: BACKEND, jev: jevStatus() };
     }
     case 'consent.toggle':
       await db.consents.put({ ...consent, enabled: cmd.enabled, epoch: consent.epoch + 1, contentSession: null, error: null });
@@ -213,8 +313,9 @@ async function panel(raw: unknown) {
       if (!episode?.closed) throw new Error('Complete the episode first');
       if ((await db.workflows.toArray()).some(w => w.occurrenceIds.includes(episode.id))) throw new Error('This episode already belongs to a pattern; confirm its intent in Patterns');
       const workflowId = crypto.randomUUID();
-      await db.transaction('rw', [db.workflows, db.feedback], async () => {
+      await db.transaction('rw', [db.workflows, db.feedback, db.episodes], async () => {
         await db.workflows.add({ id: workflowId, representativeId: episode.id, occurrenceIds: [episode.id], excludedIds: [], score: 0, feedbackVersion: 1, dismissedAtCount: null });
+        await db.episodes.update(episode.id, { grouping: 'done' });
         await db.feedback.add({ id: crypto.randomUUID(), workflowId, version: 1, time: Date.now(), type: 'intent', text: cmd.intent });
       }); return {};
     }
@@ -360,11 +461,15 @@ async function panel(raw: unknown) {
 }
 // Listeners registered synchronously; all mutations (including consent) share one serialized writer lane.
 chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
-  void serial(async () => {
+  const envelope = z.object({ type: z.string(), payload: z.object({ document: z.string().max(100) }).passthrough().optional() }).passthrough().safeParse(message);
+  const captured = envelope.success && (envelope.data.type === 'capture.event' || envelope.data.type === 'capture.context') ? envelope.data : null;
+  // Captured events are judged by Jev outside the writer lane, in per-document order, then committed serially.
+  const work: Promise<object> = captured ? inDocumentOrder(captured.payload?.document ?? 'unknown', async () => {
+    const prepared = await prepare(sender, captured.payload, captured.type === 'capture.context');
+    return serial(() => ingest(sender, prepared));
+  }) : serial(async () => {
     const envelope = z.object({ type: z.string() }).passthrough().parse(message);
     if (envelope.type.startsWith('capture.')) {
-      if (envelope.type === 'capture.event') return await ingest(sender, envelope.payload);
-      if (envelope.type === 'capture.context') return await ingest(sender, envelope.payload, true);
       if (envelope.type === 'capture.hello') {
         const c = await state(); const site = await siteFor(sender); return { enabled: !captureBlocked && c.enabled && !!site, epoch: c.epoch, content: contentConfig(c, site) };
       }
@@ -376,7 +481,8 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
     }
     if (!trusted(sender)) throw new Error('Only the side panel can manage Observe');
     await prune(); return await panel(message);
-  }).then(data => sendResponse({ ok: true, ...data }), async error => {
+  });
+  void work.then(data => sendResponse({ ok: true, ...data }), async error => {
     await serial(async () => {
       const storageFailure = error instanceof Error && /quota|indexeddb|transaction|database/i.test(error.name + error.message);
       if (storageFailure) {
@@ -425,4 +531,5 @@ void serial(async () => {
   captureBlocked = (await chrome.storage.local.get('captureBlocked')).captureBlocked === true;
   await prune(); await reconcile();
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+  scheduleGrouping(); // Resume grouping interrupted by worker termination.
 }).catch(async () => { await chrome.action.setBadgeText({ text: '!' }); });

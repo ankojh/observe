@@ -20,18 +20,23 @@ export const ContentPayload = z.object({
   epoch: z.number().int().nonnegative(), visible: z.boolean(), sessionId: z.string().uuid(), data: ContentData,
 }).strict();
 export type ContentPayload = z.infer<typeof ContentPayload>;
-export type ContentRecord = ContentData & { id: string; time: number; siteId: string; episodeId: string; document: string; sessionId: string };
+export type ContentRecord = ContentData & { id: string; time: number; siteId: string; episodeId: string; document: string; sessionId: string; relevance?: number | null };
 export type ContentFeature = { app: string; kind: ContentData['kind']; label: string; terms: string[]; fieldType: ContentData['fieldType'] };
 export const EventPayload = z.object({
   id: z.string().uuid(), document: z.string().uuid(), sequence: z.number().int().nonnegative(),
   epoch: z.number().int().nonnegative(), category: BasicCategory,
   action: Action, role: z.enum(['page', 'button', 'link', 'form', 'unknown']), visible: z.boolean(),
+  // Transient control label for Jev classification of unknown actions. Redacted in the worker and never stored.
+  hint: z.string().max(120).optional(),
 }).strict();
 export type EventPayload = z.infer<typeof EventPayload>;
-export type ObservedEvent = Omit<EventPayload, 'category'> & { category: z.infer<typeof Category>; time: number; siteId: string; tabId: number; contextRef?: string };
+export type ObservedEvent = Omit<EventPayload, 'category' | 'hint'> & { category: z.infer<typeof Category>; time: number; siteId: string; tabId: number; contextRef?: string };
 export type Episode = {
   id: string; eventIds: string[]; tokens: string[]; start: number; end: number;
   activeMs: number; closed: boolean; reason: string; gaps: string[]; timingBreak?: boolean; contentFeatures?: ContentFeature[];
+  // Closed episodes await asynchronous Jev/local grouping. Undefined on legacy rows means already grouped.
+  grouping?: 'pending' | 'done';
+  boundarySuggestion?: { probability: number; eventCount: number; time: number };
 };
 export type Feedback = {
   id: string; workflowId: string; version: number; time: number;
@@ -40,6 +45,7 @@ export type Feedback = {
 export type Workflow = {
   id: string; representativeId: string; occurrenceIds: string[]; excludedIds: string[];
   score: number; feedbackVersion: number; dismissedAtCount: number | null;
+  matchedBy?: 'jev' | 'local';
   interpretation?: { version: number; time: number; result: Interpretation; payloadHash: string; feedbackVersion: number; occurrenceCount: number };
   interpretationHistory?: Array<NonNullable<Workflow['interpretation']>>;
 };

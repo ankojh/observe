@@ -37,10 +37,17 @@ if (!globals[marker] && window.top === window) {
     if (label.length > 24) return 'unknown';
     return Object.hasOwn(allowed, label.trim().toLowerCase()) ? allowed[label.trim().toLowerCase()] : 'unknown';
   }
-  async function emit(category: Payload['category'], action: Payload['action'] = 'unknown', role: Payload['role'] = 'page') {
+  /** Short accessible name of a non-editable control, sent only for Jev classification of unknown actions. */
+  function hintFor(el: Element): string | undefined {
+    if (el.querySelector('input,textarea,select,[contenteditable]:not([contenteditable="false"])')) return;
+    const raw = el.getAttribute('aria-label') ?? el.getAttribute('title') ?? (el.textContent ?? '').slice(0, 400);
+    const text = raw.replace(/\s+/g, ' ').trim().slice(0, 120);
+    return text || undefined;
+  }
+  async function emit(category: Payload['category'], action: Payload['action'] = 'unknown', role: Payload['role'] = 'page', hint?: string) {
     if (!enabled || (document.hidden && category !== 'page.visibility_change')) return;
     if (inFlight >= 8) { void chrome.runtime.sendMessage({ type: 'capture.gap', epoch }).catch(() => {}); return; }
-    const payload = EventPayload.parse({ id: crypto.randomUUID(), document: documentId, sequence: sequence++, epoch, category, action, role, visible: !document.hidden });
+    const payload = EventPayload.parse({ id: crypto.randomUUID(), document: documentId, sequence: sequence++, epoch, category, action, role, visible: !document.hidden, ...(hint ? { hint } : {}) });
     inFlight++;
     try {
       // One idempotent retry only while the same epoch is still enabled. No offline backlog.
@@ -79,7 +86,8 @@ if (!globals[marker] && window.top === window) {
     if (!enabled || !event.isTrusted || !(event.target instanceof Element) || editable(event.target)) return;
     const el = event.target.closest('button,a,[role="button"],[role="link"]');
     if (!el || editable(el)) return;
-    void emit('control.activate', classify(el), el.matches('a,[role="link"]') ? 'link' : 'button');
+    const action = classify(el);
+    void emit('control.activate', action, el.matches('a,[role="link"]') ? 'link' : 'button', action === 'unknown' ? hintFor(el) : undefined);
   }, true);
   document.addEventListener('submit', event => {
     if (enabled && event.isTrusted) void emit('form.submit_attempt', 'unknown', 'form');

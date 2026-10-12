@@ -41,6 +41,11 @@ function contentMatch(a: Episode, b: Episode): number {
   const important = (e: Episode) => e.tokens.filter(t => /\|(content.display|field.edit|control.activate|form.submit_attempt)\|/.test(t));
   return similarity(important(a), important(b)) * 0.45 + semantic * 0.55;
 }
+/** Local similarity used to shortlist candidate patterns for Jev. Not a decision on its own. */
+export function localScore(episode: Episode, representative: Episode): number {
+  const enriched = eligibility({ ...episode, closed: true }).content && eligibility({ ...representative, closed: true }).content;
+  return enriched ? contentMatch(episode, representative) : similarity(episode.tokens, representative.tokens);
+}
 /** Each distinct completed episode is assigned once. Navigation alone never forms a workflow. */
 export function groupEpisode(episode: Episode, workflows: Workflow[], episodes: Episode[]): Workflow | null {
   if (!meaningful(episode)) return null;
@@ -56,8 +61,8 @@ export function groupEpisode(episode: Episode, workflows: Workflow[], episodes: 
     const submits = episode.tokens.some(t => t.includes('|form.submit_attempt|') && rep.tokens.includes(t));
     if (s >= score && (enriched || overlap >= 2 || overlap >= 1 && submits || submits && episode.tokens.filter(t => t.includes('|form.submit_attempt|')).length >= 2)) { best = workflow; score = s; }
   }
-  if (best) return { ...best, occurrenceIds: [...best.occurrenceIds, episode.id], score };
-  return { id: crypto.randomUUID(), representativeId: episode.id, occurrenceIds: [episode.id], excludedIds: [], score: 1, feedbackVersion: 0, dismissedAtCount: null };
+  if (best) return { ...best, occurrenceIds: [...best.occurrenceIds, episode.id], score, matchedBy: 'local' };
+  return { id: crypto.randomUUID(), representativeId: episode.id, occurrenceIds: [episode.id], excludedIds: [], score: 1, feedbackVersion: 0, dismissedAtCount: null, matchedBy: 'local' };
 }
 export function buildSummary(workflow: Workflow, episodes: Episode[], feedback: Feedback[], sites: { id: string; alias: string }[], contexts: ContentRecord[] = []): WorkflowSummary {
   const occurrences = episodes.filter(e => workflow.occurrenceIds.includes(e.id)).sort((a, b) => a.start - b.start);

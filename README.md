@@ -1,6 +1,6 @@
 # Observe
 
-A **Chrome Manifest V3 extension** for privacy-minimized workflow discovery. Record safe categories on explicitly approved sites, group distinct completed episodes locally, review a minimized summary before sharing with OpenAI, correct its interpretation, and export an editable **non-executable** agent definition.
+A **Chrome Manifest V3 extension** for privacy-minimized workflow discovery. Record safe categories on explicitly approved sites (plus page text and field edits in opt-in content-aware sessions), let TypeSafe's **Jev** make live decisions about actions, relevance, task boundaries, and which episodes are the same task, review a minimized summary before sharing with OpenAI, correct its interpretation, and export an editable **non-executable** agent definition.
 
 This is a buildable MVP implementation, not a claim of verified browser or live-provider acceptance. Automated tests were intentionally deferred at the owner's request. There is no mock AI, agent execution, replay, CREAO integration, or cloud event-stream storage.
 
@@ -19,7 +19,8 @@ npm run build
 3. Click the Observe toolbar action to open its **side panel**. Pin it if desired.
 4. Navigate to an ordinary HTTP(S) site. Click **Approve this scheme & host**, then **Start**.
 5. Inspect the real timeline. Mark each task complete using **End episode**.
-6. Repeat related sequences; three distinct completed occurrences enable **Review & analyze**.
+6. Optionally start a one-hour **content-aware session** for selected sites to capture visible text and field edits.
+7. Repeat related sequences; three distinct completed occurrences enable **Review & analyze**.
 
 No capture is enabled on first install. Optional HTTP(S) capability is not blanket access. Chrome grants a scheme/host across paths/ports; Observe additionally checks an exact approved origin (including port). No subdomain wildcard is requested.
 
@@ -48,6 +49,10 @@ The provider decision is **OpenAI**; the backend decision is **loopback-only**. 
 6. In **Patterns**, review the **entire exact outbound JSON**. You can redact app aliases and correction wording; observed actions, references, counts, and limitations remain code-authoritative. Approve that specific payload to submit a request.
 7. Confirm/correct intent and rules. Create a manual local draft, or approve a **separate** AI definition request. Review, edit, validate, and export JSON/Markdown.
 
+### Jev live decisions
+
+Add `TYPESAFE_API_KEY` and a positive `JEV_MAX_DAILY_TOKENS` to `apps/backend/.env` (optionally `JEV_MODEL`, default `jev-latest`) and restart the backend. Settings → *Backend pairing* then shows *Jev ready*. While recording, minimized and redacted data is sent to Jev automatically, without per-request approval; turn this off in Settings. Without Jev, the original local rules decide. See [privacy](docs/privacy.md#jev-live-decisions-typesafe).
+
 Cost guards reserve a conservative estimate using UTF-8 input bytes plus schema/protocol headroom and the output token cap. They are local guards, **not an invoice guarantee**; correct model prices and provider-side account limits are still required. There are no automatic charged provider retries.
 
 Jobs persist in SQLite; extension jobs persist in IndexedDB. Close/reopen the panel to resume status retrieval. Interrupted backend jobs become visible failures after restart. Results expire after 24 hours; no reviewed request payload is written to the backend database. See [architecture](docs/architecture.md) and [privacy](docs/privacy.md).
@@ -63,7 +68,9 @@ Capture, local matching, evidence inspection, feedback, manual drafting, editing
 - `apps/extension/src/storage/db.ts`: versioned extension-origin Dexie/IndexedDB.
 - `apps/extension/src/ui/`: React side panel, sharing approvals, editor, export previews.
 - `packages/core/src/`: strict shared schemas, pure sequence similarity, summaries, definitions, Markdown.
-- `apps/backend/src/`: paired loopback API, persisted jobs, bounded live OpenAI adapter.
+- `apps/backend/src/`: paired loopback API, persisted jobs, bounded live OpenAI adapter, Jev client and question templates (`jev.ts`).
+- `packages/core/src/jev.ts`: Jev request/decision contract, thresholds, episode briefs.
+- `apps/extension/src/jev.ts`: worker-side Jev client with fallback status.
 - `scripts/demo-sites.mjs`: ordinary synthetic demo pages; no special capture attributes.
 
 ## Documentation and verification
@@ -75,4 +82,4 @@ Capture, local matching, evidence inspection, feedback, manual drafting, editing
 - [Original builder handoff](docs/builder-handoff.md)
 - [Sanitized sample definition](docs/sample-definition.json) / [Markdown](docs/sample-definition.md)
 
-`npm run typecheck` checks all TypeScript. `npm run build` typechecks and creates the unpacked extension. No automated test suite has been added or run. Manual Chrome checks and live OpenAI end-to-end validation are still required; see the verification document for exact status. No commits or pushes were made.
+`npm run typecheck` checks all TypeScript. `npm run build` typechecks and creates the unpacked extension. No automated test suite has been added or run. Manual Chrome checks and live OpenAI end-to-end validation are still required; see the verification document for exact status.

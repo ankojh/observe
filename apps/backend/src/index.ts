@@ -5,7 +5,9 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'n
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { DefinitionInput, JobRequest, WorkflowSummary } from '../../../packages/core/src/schemas';
+import { JevRequest, JEV_LIMITS } from '../../../packages/core/src/jev';
 import { OpenAIInterpreter, SYSTEM } from './provider';
+import { JevClient } from './jev';
 
 const dir = fileURLToPath(new URL('../data/', import.meta.url));
 mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -29,11 +31,16 @@ const outputRate = price('OUTPUT_USD_PER_MILLION_TOKENS');
 const maxOutputTokens = Number(process.env.MAX_OUTPUT_TOKENS ?? 2500);
 const configured = !!(model && apiKey && requestCap && dayCap && inputRate && outputRate && process.env.PROVIDER_TERMS_ACKNOWLEDGED === 'true' && Number.isInteger(maxOutputTokens) && maxOutputTokens >= 512 && maxOutputTokens <= 4096);
 const provider = configured ? new OpenAIInterpreter({ model: model!, apiKey: apiKey!, maxOutputTokens }) : null;
+const jevModel = process.env.JEV_MODEL || 'jev-latest';
+const jevDailyTokens = Number(process.env.JEV_MAX_DAILY_TOKENS);
+const jevConfigured = !!process.env.TYPESAFE_API_KEY && Number.isInteger(jevDailyTokens) && jevDailyTokens > 0;
+const jev = jevConfigured ? new JevClient({ apiKey: process.env.TYPESAFE_API_KEY!, model: jevModel }) : null;
 const db = new DatabaseSync(`${dir}jobs.sqlite`);
 chmodSync(`${dir}jobs.sqlite`, 0o600);
 db.exec(`PRAGMA journal_mode=WAL;
  CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, hash TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, created INTEGER NOT NULL, result TEXT, error TEXT);
- CREATE TABLE IF NOT EXISTS budgets (day TEXT PRIMARY KEY, reserved REAL NOT NULL);`);
+ CREATE TABLE IF NOT EXISTS budgets (day TEXT PRIMARY KEY, reserved REAL NOT NULL);
+ CREATE TABLE IF NOT EXISTS jev_usage (day TEXT PRIMARY KEY, tokens INTEGER NOT NULL);`);
 db.prepare("UPDATE jobs SET state='failed', result=NULL, error='Server restarted; request interrupted. Approve a fresh request.' WHERE state IN ('pending','running')").run();
 type Row = { id: string; hash: string; kind: string; state: string; created: number; result: string | null; error: string | null };
 const get = (id: string) => db.prepare('SELECT * FROM jobs WHERE id=?').get(id) as Row | undefined;
@@ -43,6 +50,7 @@ let active = 0;
 const cleanup = () => {
   db.prepare("DELETE FROM jobs WHERE created < ? AND state NOT IN ('pending','running')").run(Date.now() - 24 * 3600000);
   db.prepare('DELETE FROM budgets WHERE day < ?').run(new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10));
+  db.prepare('DELETE FROM jev_usage WHERE day < ?').run(new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10));
 };
 cleanup(); setInterval(cleanup, 3600000).unref();
 function pump() {
@@ -89,7 +97,28 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: '48kb', strict: true }));
-app.get('/health', (_req, res) => res.json({ ok: true, provider: 'OpenAI', configured, model: model ?? null, retentionHours: 24, mockProvider: false, note: 'No mock provider. Model, costs, and account terms must be configured before any call.' }));
+app.get('/health', (_req, res) => res.json({ ok: true, provider: 'OpenAI', configured, model: model ?? null, retentionHours: 24, mockProvider: false, jev: { configured: jevConfigured, model: jevConfigured ? jevModel : null }, note: 'No mock provider. Model, costs, and account terms must be configured before any call.' }));
+let jevRequests: number[] = [];
+// Synchronous Jev decisions for live capture. State is transient: nothing about the request is persisted except daily token usage.
+app.post('/jev', async (req, res) => {
+  if (!jev) { res.status(503).json({ error: 'Jev disabled: set TYPESAFE_API_KEY and JEV_MAX_DAILY_TOKENS on the backend.' }); return; }
+  const parsed = JevRequest.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'Invalid Jev request' }); return; }
+  jevRequests = jevRequests.filter(t => t > Date.now() - 60000);
+  if (jevRequests.length >= 240) { res.status(429).json({ error: 'Local Jev request limit reached.' }); return; }
+  const day = new Date().toISOString().slice(0, 10);
+  const used = (db.prepare('SELECT tokens FROM jev_usage WHERE day=?').get(day) as { tokens: number } | undefined)?.tokens ?? 0;
+  if (used >= jevDailyTokens) { res.status(429).json({ error: 'Configured daily Jev token limit reached.' }); return; }
+  jevRequests.push(Date.now());
+  try {
+    const { decision, inputTokens } = await jev.ask(parsed.data, AbortSignal.timeout(JEV_LIMITS.timeoutMs - 500));
+    db.prepare('INSERT INTO jev_usage(day,tokens) VALUES (?,?) ON CONFLICT(day) DO UPDATE SET tokens=tokens+excluded.tokens').run(day, inputTokens);
+    res.json(decision);
+  } catch (error) {
+    const detail = error instanceof Error && /^Jev /.test(error.message) ? error.message.slice(0, 200) : error instanceof DOMException ? 'Jev request timed out.' : 'Jev returned an unexpected response.';
+    res.status(502).json({ error: detail });
+  }
+});
 let requests: number[] = [];
 app.post(['/analysis-jobs', '/definition-jobs'], (req, res) => {
   const parsed = JobRequest.safeParse(req.body);
@@ -146,7 +175,7 @@ app.use((error: { type?: string; status?: number }, _req: express.Request, res: 
   res.status(error.status === 413 ? 413 : 400).json({ error: error.status === 413 ? 'Payload too large' : 'Invalid request' });
 });
 const server = app.listen(4317, '127.0.0.1', () => {
-  console.log(`Observe backend: http://127.0.0.1:4317 (loopback only). Live AI ${configured ? 'configured' : 'DISABLED until configured'}.`);
+  console.log(`Observe backend: http://127.0.0.1:4317 (loopback only). Live AI ${configured ? 'configured' : 'DISABLED until configured'}. Jev ${jevConfigured ? `configured (${jevModel})` : 'DISABLED until configured'}.`);
   console.log(`Pairing token file: ${tokenFile} (copy into extension settings; never commit or share it).`);
 });
 server.requestTimeout = 15000; server.headersTimeout = 10000;
