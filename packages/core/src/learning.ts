@@ -2,7 +2,7 @@ import type { ContentRecord, Episode, Feedback, ObservedEvent, Workflow, Workflo
 import { WorkflowSummary as SummarySchema } from './schemas';
 import { contentTerms, termSimilarity } from './privacy';
 
-export const LIMITS = { inactivityMs: 120_000, intervalCapMs: 30_000, episodeEvents: 120, retentionDays: 7, eventCap: 10_000, similarity: 0.76, contentSimilarity: 0.72 };
+export const LIMITS = { inactivityMs: 120_000, intervalCapMs: 30_000, episodeEvents: 120, retentionDays: 7, eventCap: 10_000, similarity: 0.76, contentSimilarity: 0.72, candidateTtlDays: 7 };
 export function token(event: ObservedEvent): string { return `${event.siteId}|${event.category}|${event.action}`; }
 const weight = (t: string) => /\|(field.edit|form.submit_attempt)\|/.test(t) ? 1.5 : t.includes('|content.display|') ? 1.2 : t.endsWith('|unknown') ? 0.35 : t.includes('|control.activate|') ? 1.5 : 0.6;
 /** Weighted normalized edit distance. Max 120 tokens per episode: O(120²). Not a probability. */
@@ -64,7 +64,8 @@ export function groupEpisode(episode: Episode, workflows: Workflow[], episodes: 
   if (best) return { ...best, occurrenceIds: [...best.occurrenceIds, episode.id], score, matchedBy: 'local' };
   return { id: crypto.randomUUID(), representativeId: episode.id, occurrenceIds: [episode.id], excludedIds: [], score: 1, feedbackVersion: 0, dismissedAtCount: null, matchedBy: 'local' };
 }
-export function buildSummary(workflow: Workflow, episodes: Episode[], feedback: Feedback[], sites: { id: string; alias: string }[], contexts: ContentRecord[] = []): WorkflowSummary {
+export function buildSummary(workflow: Workflow, episodes: Episode[], feedback: Feedback[], sites: { id: string; alias: string }[], contexts: ContentRecord[] = [], events: ObservedEvent[] = []): WorkflowSummary {
+  const eventsById = new Map(events.map(e => [e.id, e]));
   const occurrences = episodes.filter(e => workflow.occurrenceIds.includes(e.id)).sort((a, b) => a.start - b.start);
   if (!occurrences.length) throw new Error('No surviving evidence');
   const refs = new Set(occurrences.flatMap(e => e.tokens.map(t => t.split('|')[0])));
@@ -79,7 +80,7 @@ export function buildSummary(workflow: Workflow, episodes: Episode[], feedback: 
       const evidence = contexts.filter(c => c.episodeId === e.id);
       // Latest display plus up to three settled edits; bounded, explicit privacy preview.
       const selected = [...evidence.filter(c => c.kind === 'content.display').slice(-1), ...evidence.filter(c => c.kind === 'field.edit').slice(-3)].sort((a, b) => a.time - b.time);
-      return { ref: e.id, actions: e.tokens.map(t => { const [app, category, action] = t.split('|'); return { app, category, action }; }), approximateActiveMs: e.activeMs,
+      return { ref: e.id, actions: summaryActions(e, eventsById), approximateActiveMs: e.activeMs,
         content: selected.map(c => ({ ref: c.id, kind: c.kind, label: c.label, text: c.text.slice(0, 900), before: c.before === null ? null : c.before.slice(0, 600), after: c.after.slice(0, 600), fieldType: c.fieldType, truncated: c.truncated || c.text.length > 900 || (c.before?.length ?? 0) > 600 || c.after.length > 600 })),
       };
     }),
@@ -102,4 +103,16 @@ export function buildSummary(workflow: Workflow, episodes: Episode[], feedback: 
   while (new TextEncoder().encode(JSON.stringify(summary)).length > 39000 && summary.occurrences.length > 1) summary.occurrences.shift();
   if (summary.occurrences.length < occurrences.length) summary.limitations.push(`Only ${summary.occurrences.length} recent occurrences are shared; total count and timing are computed from all surviving evidence.`);
   return SummarySchema.parse(summary);
+}
+
+/** Actions with clicked element names and page routes when events survive; otherwise the bare token sequence. */
+function summaryActions(episode: Episode, eventsById: Map<string, ObservedEvent>) {
+  const own = episode.eventIds.map(id => eventsById.get(id)).filter((e): e is ObservedEvent => !!e && e.category !== 'page.visibility_change');
+  if (!own.length) return episode.tokens.map(t => { const [app, category, action] = t.split('|'); return { app, category, action }; });
+  const actions: { app: string; category: string; action: string; target?: string; page?: string }[] = [];
+  for (const e of own) {
+    const next = { app: e.siteId, category: e.category, action: e.action, ...(e.target ? { target: e.target.slice(0, 80) } : {}), ...(e.route ? { page: e.route.slice(0, 200) } : {}) };
+    if (JSON.stringify(actions[actions.length - 1]) !== JSON.stringify(next)) actions.push(next);
+  }
+  return actions.slice(-120);
 }

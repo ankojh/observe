@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { liveQuery } from 'dexie';
-import { db, initialConsent, type Consent, type AIJob } from '../storage/db';
+import { db, initialConsent, type Consent, type AIJob, type Site } from '../storage/db';
 import { AgentDefinition as DefinitionSchema, DefinitionInput, WorkflowSummary, type AgentDefinition, type Episode, type Feedback, type ObservedEvent, type Workflow } from '../../../../packages/core/src/schemas';
 import { markdown } from '../../../../packages/core/src/definitions';
 import { JEV_THRESHOLDS } from '../../../../packages/core/src/jev';
@@ -22,11 +22,8 @@ function App() {
   const [settings, setSettings] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState<{ origin: string | null; collecting: boolean; contentActive?: boolean; jev?: JevStatus }>({ origin: null, collecting: false });
+  const [status, setStatus] = useState<{ origin: string | null; collecting: boolean; contentActive?: boolean; jev?: JevStatus; discardedToday?: number }>({ origin: null, collecting: false });
   const [jevEnabled, setJevEnabled] = useState(true);
-  const [contentSites, setContentSites] = useState<string[]>([]);
-  const [contentAck, setContentAck] = useState(false);
-  const [describe, setDescribe] = useState<Record<string, string>>({});
   const [siteInput, setSiteInput] = useState('');
   const [pairing, setPairing] = useState('');
   const [health, setHealth] = useState('Not paired');
@@ -62,6 +59,16 @@ function App() {
     if (!await chrome.permissions.request({ origins: [pattern] })) throw new Error('Site permission not granted');
     await command({ type: 'site.grant', origin: url.origin });
   };
+  const enableAllSites = async () => {
+    // Called directly from the click: runtime permission requests need the user gesture.
+    if (!await chrome.permissions.request({ origins: ['http://*/*', 'https://*/*'] })) throw new Error('Access to all websites was not granted');
+    await command({ type: 'allsites.set', enabled: true });
+  };
+  const disableAllSites = async () => {
+    if (!window.confirm('Stop recording on all websites? Discovered sites are removed; manually approved sites keep recording.')) return;
+    await command({ type: 'allsites.set', enabled: false });
+    await chrome.permissions.remove({ origins: ['http://*/*', 'https://*/*'] });
+  };
   const openShare = async (w: Workflow, kind: 'analysis' | 'definition') => {
     const result = await command({ type: 'summary', workflowId: w.id });
     const { ok: _ok, ...summary } = result;
@@ -93,7 +100,16 @@ function App() {
     setTimeout(() => URL.revokeObjectURL(url), 10000); setExportPreview(null);
   };
   const currentApproved = memory.consent.sites.some(s => s.origin === status.origin);
-  const stateLabel = memory.consent.error ? 'Capture error' : !memory.consent.enabled ? 'Observation paused' : status.collecting ? 'Observing approved site' : 'Enabled · no capture here';
+  const currentSite = memory.consent.sites.find(s => s.origin === status.origin);
+  const capturing = (s: Site) => !s.blocked && !s.verdict?.sensitive;
+  const siteState = (s: Site) => s.blocked ? 'Blocked by you' : s.verdict?.sensitive ? `Skipped · ${s.verdict.category.replaceAll('_', ' ')}` : s.auto && !s.verdict ? 'Recording · screening pending' : s.verdict ? `Recording · ${s.verdict.category.replaceAll('_', ' ')}` : 'Recording';
+  /** Readable default title from the main actions, until intent is confirmed or OpenAI names it. */
+  const stepsTitle = (w: Workflow) => {
+    const e = memory.episodes.find(x => x.id === w.representativeId); if (!e) return 'Recorded workflow';
+    const steps = e.tokens.map(t => t.split('|')).filter(([, c, a]) => a !== 'unknown' || c === 'form.submit_attempt').map(([app, c, a]) => `${alias(app)} ${c === 'form.submit_attempt' ? 'submit' : a}`);
+    return [...new Set(steps)].slice(0, 5).join(' → ') || `${[...new Set(e.tokens.map(t => alias(t.split('|')[0])))].join(', ')} activity`;
+  };
+  const stateLabel = memory.consent.error ? 'Capture error' : !memory.consent.enabled ? 'Recording paused' : status.collecting ? (status.contentActive ? 'Recording this site · with page text' : 'Recording this site') : currentSite && !capturing(currentSite) ? 'Skipped on this site' : 'On · nothing to record here';
   const completed = memory.episodes.filter(e => e.closed).length;
   const priority = (w: Workflow) => {
     const episodes = memory.episodes.filter(e => w.occurrenceIds.includes(e.id));
@@ -104,7 +120,7 @@ function App() {
   const ranked = [...memory.workflows].sort((a, b) => priority(b) - priority(a) || b.occurrenceIds.length - a.occurrenceIds.length);
   return <>
     <header>
-      <div className="brand"><span className="brandmark">◉</span><div><h1>Observe<span className="mvp">LOCAL FIRST</span></h1><p>Turn repeated work into a considered draft.</p></div><button className="icon" aria-label="Settings" onClick={() => setSettings(!settings)}>⚙</button></div>
+      <div className="brand"><span className="brandmark">◉</span><div><h1>Observe<span className="mvp">AUTO-DISCOVERY</span></h1><p>Turn repeated work into a considered draft.</p></div><button className="icon" aria-label="Settings" onClick={() => setSettings(!settings)}>⚙</button></div>
       <div className={`status ${status.collecting ? 'on' : ''}`}><span className="dot"/><span>{stateLabel}</span><button disabled={busy} onClick={() => send({ type: 'consent.toggle', enabled: !memory.consent.enabled })}>{memory.consent.enabled ? 'Pause' : 'Start'}</button></div>
       <nav>{(['Activity', 'Patterns', 'Agent drafts'] as const).map(t => <button key={t} className={tab === t ? 'selected' : ''} onClick={() => setTab(t)}>{t}{t === 'Patterns' && memory.workflows.length > 0 && <i>{memory.workflows.length}</i>}</button>)}</nav>
     </header>
@@ -112,8 +128,15 @@ function App() {
       {error && <div className="alert" role="alert"><span>{error}</span><button onClick={() => setError('')} aria-label="Dismiss error">×</button></div>}
       {memory.consent.error && <div className="alert">{memory.consent.error}</div>}
       {settings && <section className="card settings"><div className="sectiontitle"><h2>Settings & privacy</h2><button onClick={() => setSettings(false)}>Done</button></div>
-        <h3>Approved sites · local only</h3><p className="muted">Hosts stay in this installation. Permissions cover the exact scheme and host (all paths and ports), not subdomains. Capture additionally requires an exact approved origin, including port.</p>
-        {memory.consent.sites.map(s => <div className="site" key={s.id}><code>{s.origin}</code><div className="row"><input aria-label="App alias" defaultValue={s.alias} maxLength={80} onBlur={e => { if (e.target.value !== s.alias) void send({ type: 'site.alias', siteId: s.id, alias: e.target.value }); }}/><button className="danger" disabled={busy} onClick={() => send({ type: 'site.revoke', siteId: s.id })}>Revoke</button></div></div>)}
+        <h3>Recording scope</h3>
+        {memory.consent.allSites ? <><p className="muted">Recording on all websites. Each new site is screened by a local list and by Jev; banking, health, government, login, HR, and adult sites are skipped. Block any other site below.</p><button disabled={busy} onClick={() => run(disableAllSites)}>Stop recording on all websites</button></>
+          : <><p className="muted">Recording only on sites you approve. Permissions cover the exact scheme and host (all paths and ports), not subdomains.</p><button className="primary" disabled={busy} onClick={() => run(enableAllSites)}>Record on all websites</button></>}
+        <label className="check"><input type="checkbox" checked={memory.consent.contentEnabled} onChange={e => send({ type: 'content.toggle', enabled: e.target.checked })}/>Capture page text and field edits (password, payment, login, and one-time-code fields are always skipped)</label>
+        <h3>Sites · local only</h3>
+        {memory.consent.sites.length === 0 && <p className="note">No sites yet.</p>}
+        {memory.consent.sites.map(s => <div className="site" key={s.id}><code>{s.origin}</code> <span className={`pill ${capturing(s) ? 'green' : ''}`}>{siteState(s)}</span><div className="row"><input aria-label="App alias" defaultValue={s.alias} maxLength={80} onBlur={e => { if (e.target.value !== s.alias) void send({ type: 'site.alias', siteId: s.id, alias: e.target.value }); }}/>
+          {s.auto ? <button className={s.blocked ? '' : 'danger'} disabled={busy} onClick={() => send({ type: 'site.block', siteId: s.id, blocked: !s.blocked })}>{s.blocked ? 'Unblock' : 'Block'}</button>
+            : <button className="danger" disabled={busy} onClick={() => send({ type: 'site.revoke', siteId: s.id })}>Revoke</button>}</div></div>)}
         <h3>Backend pairing</h3><p className="muted">Loopback only: <code>127.0.0.1:4317</code>. This permission is separate from site observation. Token stays in trusted extension storage and is never exported.</p>
         <p className="muted">Extension origin: <code className="break">{location.origin}</code></p>
         <input type="password" autoComplete="off" placeholder="Paste pairing token from backend token file" value={pairing} onChange={e => setPairing(e.target.value)}/>
@@ -124,43 +147,35 @@ function App() {
           const result = await backend('/health');
           setHealth(`${result.configured ? `Live OpenAI ready · ${result.model}` : 'Connected · OpenAI disabled until server configuration is complete'} · ${result.jev?.configured ? `Jev ready · ${result.jev.model}` : 'Jev disabled until TYPESAFE_API_KEY is set'}`);
         })}>Pair & check</button><button onClick={() => run(async () => { await chrome.storage.local.remove('pairingToken'); setPairing(''); setHealth('Not paired'); })}>Forget token</button></div><p className="note">{health}</p>
-        <h3>Jev live decisions · TypeSafe</h3><p className="muted">While recording, minimized and redacted episode data goes through your loopback backend to TypeSafe's Jev. Jev classifies unclear clicks, drops boilerplate and likely-sensitive captured text, suggests when a task looks finished, and decides which pattern an episode belongs to. Local rules decide whenever Jev is off or unavailable.</p>
+        <h3>Jev live decisions · TypeSafe</h3><p className="muted">While recording, minimized and redacted data goes through your loopback backend to TypeSafe's Jev. Jev screens new sites, names unclear clicks, drops boilerplate and likely-sensitive text, ends finished tasks, decides whether each finished episode is routine work worth keeping, and matches repeats. Local rules decide whenever Jev is off or unavailable.</p>
         <p className="note">Status: {status.jev ? `${status.jev.state} · ${status.jev.detail}${status.jev.model ? ` · ${status.jev.model}` : ''}${status.jev.decisions ? ` · ${status.jev.decisions} decisions this session` : ''}` : 'unknown'}</p>
         <label className="check"><input type="checkbox" checked={jevEnabled} onChange={e => { const next = e.target.checked; setJevEnabled(next); void chrome.storage.local.set({ jevEnabled: next }); }}/>Send recordings to Jev for live decisions</label>
         <h3>Retention & deletion</h3><label>Evidence retention <select value={memory.consent.retentionDays} onChange={e => send({ type: 'retention', days: Number(e.target.value) })}>{[1, 3, 7, 14, 30].map(d => <option key={d} value={d}>{d} days</option>)}</select></label>
-        <p className="muted">10,000-event cap. Aging evidence invalidates dependent episodes, interpretations, and drafts. Backend results expire after 24 hours. OpenAI account retention is governed by your account terms, not local reset.</p>
+        <p className="muted">Episodes Jev judges not worth keeping are deleted when they end. Unsaved page text expires after 24 hours. Candidates seen once expire after 7 days unless pinned or repeated. 10,000-event cap. Aging evidence invalidates dependent episodes, interpretations, and drafts. Backend results expire after 24 hours. OpenAI account retention is governed by your account terms, not local reset.</p>
         <label className="check"><input type="checkbox" checked={retainSites} onChange={e => setRetainSites(e.target.checked)}/>Keep site approvals after reset (observation remains paused)</label>
         <button className="danger" disabled={busy} onClick={() => run(reset)}>Pause & delete all local data</button>
       </section>}
       {tab === 'Activity' && <>
-        <section className="intro"><span className="eyebrow">01 / OBSERVE</span><h2>Evidence before assumptions.</h2><p>Safe interaction categories by default. Page text and field edits only during a content-aware session you start. Never full URLs or background-tab activity. While recording, minimized data is sent to Jev for live decisions unless you turn it off in Settings.</p></section>
-        <section className="card"><div className="sectiontitle"><h3>This site</h3><span className={`pill ${currentApproved ? 'green' : ''}`}>{currentApproved ? 'Approved' : 'Not approved'}</span></div>
-          <code className="break">{status.origin ?? 'Current site URL unavailable — enter its origin below'}</code>
-          {!status.origin && <input placeholder="https://example.com" value={siteInput} onChange={e => setSiteInput(e.target.value)}/>}
-          {!currentApproved && <button className="primary full" disabled={busy || (!status.origin && !siteInput)} onClick={() => run(approveSite)}>Approve this scheme & host</button>}
-          <p className="muted">Declaring optional HTTP(S) capability does not grant access to every site. You choose each host.</p>
-        </section>
-        <section className="card"><div className="sectiontitle"><h3>Content-aware recording</h3><span className={`pill ${memory.consent.contentSession ? 'green' : ''}`}>{memory.consent.contentSession ? `On until ${clock(memory.consent.contentSession.expiresAt)}` : 'Off'}</span></div>
-          {memory.consent.contentSession ? <>
-            <p className="muted">Recording visible page text and settled edits in supported text fields on {memory.consent.contentSession.siteIds.map(alias).join(', ')}. Password, payment, login, and one-time-code fields are skipped. An on-page badge shows while it's active.</p>
-            <button className="danger full" disabled={busy} onClick={() => send({ type: 'content.stop' })}>Stop content recording</button>
-          </> : <>
-            <p className="muted">Captures what's visible on the page and what you type into ordinary text fields, so patterns and Jev decisions reflect the actual work. Redaction is best effort. Sessions last one hour; captured text expires after 24 hours.</p>
-            {memory.consent.sites.length === 0 ? <p className="note">Approve a site first.</p> : memory.consent.sites.map(s => <label className="check" key={s.id}><input type="checkbox" checked={contentSites.includes(s.id)} onChange={e => setContentSites(ids => e.target.checked ? [...ids, s.id] : ids.filter(id => id !== s.id))}/>{s.alias} <code>{s.origin}</code></label>)}
-            <label className="check"><input type="checkbox" checked={contentAck} onChange={e => setContentAck(e.target.checked)}/>I understand page text and my field edits on these sites will be stored locally and may be sent to Jev and, after my approval, OpenAI.</label>
-            <button className="primary full" disabled={busy || !contentAck || !contentSites.some(id => memory.consent.sites.some(s => s.id === id))} onClick={() => run(async () => { await command({ type: 'content.start', siteIds: contentSites.filter(id => memory.consent.sites.some(s => s.id === id)), acknowledged: true }); setContentAck(false); })}>Start one-hour content session</button>
-          </>}
-        </section>
-        <div className="metrics"><div><b>{memory.events.length >= 100 ? '100+' : memory.events.length}</b><span>recent events</span></div><div><b>{completed}</b><span>completed episodes</span></div><div><b>{memory.consent.sites.length}</b><span>approved origins</span></div></div>
-        <section className="card"><div className="sectiontitle"><h3>Episode boundaries</h3><button disabled={busy || !memory.episodes.some(e => !e.closed)} onClick={() => send({ type: 'episode.end' })}>End episode</button></div><p className="muted">Mark each task complete. Cross-tab activity on approved apps can stay together; idle, unobserved intervals, pause, and loss of browser focus split it.</p>
-          {!memory.episodes.length && <Empty title="Your first episode starts here" text="Approve a site, start observation, and use ordinary buttons or forms. Then mark the episode complete."/>}
+        <section className="intro"><span className="eyebrow">01 / OBSERVE</span><h2>Work normally.</h2><p>Observe records in the background, ends tasks on its own, and keeps only episodes Jev judges to be routine work. Everything else is deleted when the episode ends. Sensitive sites are skipped; never full URLs or background tabs.</p></section>
+        {!memory.consent.allSites && memory.consent.sites.length === 0 ? <section className="card"><h3>Start recording</h3>
+          <p className="muted">Allow Observe on all websites once. It records in the background and skips banking, health, government, login, HR, and adult sites, plus any site you block. You can pause at any time.</p>
+          <button className="primary full" disabled={busy} onClick={() => run(enableAllSites)}>Record on all websites</button>
+          <p className="note">Prefer to choose sites? Approve just the current one below.</p>
+          {!currentApproved && <button className="full" disabled={busy || !status.origin} onClick={() => run(approveSite)}>Approve only this site</button>}
+        </section> : <section className="card"><div className="sectiontitle"><h3>This site</h3><span className={`pill ${currentSite && capturing(currentSite) ? 'green' : ''}`}>{currentSite ? siteState(currentSite) : memory.consent.allSites ? 'New · screening on first visit' : 'Not approved'}</span></div>
+          <code className="break">{status.origin ?? 'Not a recordable page'}</code>
+          {currentSite?.auto && <button disabled={busy} onClick={() => send({ type: 'site.block', siteId: currentSite.id, blocked: !currentSite.blocked })}>{currentSite.blocked ? 'Unblock this site' : 'Block this site'}</button>}
+          {!memory.consent.allSites && !currentApproved && status.origin && <button className="primary full" disabled={busy} onClick={() => run(approveSite)}>Approve this scheme & host</button>}
+        </section>}
+        <div className="metrics"><div><b>{memory.events.length >= 100 ? '100+' : memory.events.length}</b><span>recent events</span></div><div><b>{memory.workflows.length}</b><span>saved patterns</span></div><div><b>{status.discardedToday ?? 0}</b><span>discarded today</span></div></div>
+        <section className="card"><div className="sectiontitle"><h3>Episodes</h3><button disabled={busy || !memory.episodes.some(e => !e.closed)} onClick={() => send({ type: 'episode.end' })}>End episode</button></div><p className="muted">Episodes end on their own when Jev sees a finished task, after two idle minutes, or when you leave recorded sites. Ending one yourself is optional. Mark each task complete. Cross-tab activity on approved apps can stay together; idle, unobserved intervals, pause, and loss of browser focus split it.</p>
+          {!memory.episodes.length && <Empty title="Nothing kept yet" text="Work as usual on recorded sites. Finished episodes that look like routine work appear here; the rest are discarded."/>}
           {memory.episodes.slice(0, 20).map(e => {
             const grouped = memory.workflows.some(w => w.occurrenceIds.includes(e.id));
-            const suggestion = !e.closed && e.boundarySuggestion && e.boundarySuggestion.probability >= JEV_THRESHOLDS.finished && e.eventIds.length - e.boundarySuggestion.eventCount <= 2 ? e.boundarySuggestion : null;
-            return <div className="episode" key={e.id}><div className="row"><button className="textbutton" onClick={() => setExpanded(expanded === e.id ? null : e.id)}>{e.closed ? '◇' : '●'} {clock(e.start)} · {e.eventIds.length} events</button><span className="muted">≈ {duration(e.activeMs)}</span></div><p className="note">{e.closed ? `${e.reason}${e.grouping === 'pending' ? ' · matching…' : ''}` : 'Recording · not yet counted as an occurrence'}</p>
+            const suggestion = !e.closed && e.boundarySuggestion && e.boundarySuggestion.probability >= JEV_THRESHOLDS.suggestFinished && e.eventIds.length - e.boundarySuggestion.eventCount <= 2 ? e.boundarySuggestion : null;
+            return <div className="episode" key={e.id}><div className="row"><button className="textbutton" onClick={() => setExpanded(expanded === e.id ? null : e.id)}>{e.closed ? '◇' : '●'} {clock(e.start)} · {e.eventIds.length} events</button><span className="muted">≈ {duration(e.activeMs)}</span></div><p className="note">{e.closed ? `${e.reason}${e.grouping === 'pending' ? ' · deciding whether to keep…' : grouped ? ' · saved' : ''}` : 'Recording'}</p>
             {suggestion && <div className="notice">Jev: this task looks finished ({Math.round(suggestion.probability * 100)}%). <button disabled={busy} onClick={() => send({ type: 'episode.end' })}>End episode</button></div>}
             {expanded === e.id && <><TokenList tokens={e.tokens} alias={alias}/>{e.gaps.length > 0 && <p className="note">Gaps: {e.gaps.join('; ')}</p>}
-            {e.closed && !grouped && e.grouping !== 'pending' && <div className="row"><input maxLength={1200} placeholder="Describe this task to keep it as a pattern…" value={describe[e.id] ?? ''} onChange={v => setDescribe(d => ({ ...d, [e.id]: v.target.value }))}/><button disabled={busy || !describe[e.id]?.trim()} onClick={() => run(async () => { await command({ type: 'episode.describe', id: e.id, intent: describe[e.id].trim() }); setDescribe(d => ({ ...d, [e.id]: '' })); })}>Save</button></div>}
             <button className="danger" onClick={() => run(async () => {
               if (!window.confirm('Delete this episode and invalidate dependent drafts and analysis?')) return;
               const jobs = memory.jobs;
@@ -169,12 +184,12 @@ function App() {
           </div>; })}
         </section>
         <section className="card"><div className="sectiontitle"><h3>Recorded timeline</h3><span className="pill">OBSERVED</span></div><p className="muted">Latest 100 minimized events, newest first. Submit means an attempt, not success.</p>
-          {memory.events.length === 0 ? <p className="muted">No observations stored.</p> : <div className="timeline">{memory.events.map(e => <div className="event" key={e.id}><time>{clock(e.time)}</time><div><strong>{alias(e.siteId)}</strong><p>{e.category}{e.action !== 'unknown' ? ` · ${e.action}` : ''}</p></div><span title="Observed">↳</span></div>)}</div>}
+          {memory.events.length === 0 ? <p className="muted">No observations stored.</p> : <div className="timeline">{memory.events.map(e => <div className="event" key={e.id}><time>{clock(e.time)}</time><div><strong>{alias(e.siteId)}</strong><p>{e.category}{e.action !== 'unknown' ? ` · ${e.action}` : ''}{e.target ? ` · "${e.target}"` : ''}{e.route ? ` · ${e.route}` : ''}</p></div><span title="Observed">↳</span></div>)}</div>}
         </section>
       </>}
       {tab === 'Patterns' && <>
-        <section className="intro"><span className="eyebrow">02 / RECOGNIZE & CONFIRM</span><h2>Repetition, not certainty.</h2><p>Jev decides which episodes are the same task, choosing from patterns shortlisted by local matching; local rules decide when Jev is unavailable. OpenAI interpretation happens only after you review the exact summary.</p></section>
-        {!memory.workflows.length && <Empty title="Let the evidence accumulate" text="Complete three similar episodes to enable hosted analysis. Two meaningful safe actions are needed; site order alone never establishes a pattern."/>}
+        <section className="intro"><span className="eyebrow">02 / RECOGNIZE & CONFIRM</span><h2>Repetition, not certainty.</h2><p>A single episode is kept as a candidate when Jev judges it routine work. It becomes a pattern when it repeats; unrepeated candidates expire after 7 days unless pinned. OpenAI names and explains a pattern only after you review the exact summary.</p></section>
+        {!memory.workflows.length && <Empty title="No candidates yet" text="Finish a routine task on a recorded site, like processing a record or replying to a request. If Jev judges it routine work, it appears here after one pass."/>}
         {memory.workflows.length > 0 && <p className="muted">Priority: occurrences × mean approximate active time ÷ (1 + known capture gaps). Feasibility is not confirmed and capabilities remain unverified.</p>}
         {ranked.map(w => {
           const occurrences = memory.episodes.filter(e => w.occurrenceIds.includes(e.id));
@@ -186,9 +201,10 @@ function App() {
           const active = jobs.some(j => ['approved', 'pending', 'running'].includes(j.state));
           const mean = occurrences.length ? occurrences.reduce((n, e) => n + e.activeMs, 0) / occurrences.length : 0;
           return <section className={`card pattern ${suppressed ? 'dimmed' : ''}`} key={w.id}>
-            <div className="sectiontitle"><span className="eyebrow">{suppressed ? 'DISMISSED' : occurrences.length >= 3 ? 'READY FOR REVIEW' : occurrences.length === 2 ? 'EMERGING PATTERN' : 'CANDIDATE'}</span><span className="pill">{occurrences.length} occurrences</span></div>
-            <h3>{intent?.text ?? w.interpretation?.result.name ?? 'Repeated interaction sequence'}</h3>
-            <p className="note">{intent ? 'USER-CONFIRMED INTENT' : w.interpretation ? 'INFERRED · hosted OpenAI' : 'LOCAL HEURISTIC · purpose unknown'}</p>
+            <div className="sectiontitle"><span className="eyebrow">{suppressed ? 'DISMISSED' : occurrences.length >= 2 ? 'PATTERN · REPEATED' : w.pinned ? 'CANDIDATE · PINNED' : 'CANDIDATE · SEEN ONCE'}</span><span className="pill">{occurrences.length} occurrences</span></div>
+            <h3>{intent?.text ?? w.interpretation?.result.name ?? stepsTitle(w)}</h3>
+            <p className="note">{intent ? 'USER-CONFIRMED INTENT' : w.interpretation ? 'INFERRED · hosted OpenAI' : 'STEPS ONLY · purpose not yet named'}</p>
+            {w.candidate && <div className="facts"><span>Jev: work {Math.round(w.candidate.work * 100)}%</span><span>routine {Math.round(w.candidate.routine * 100)}%</span><span>automatable {Math.round(w.candidate.automatable * 100)}%</span></div>}
             <div className="facts"><span>≈ {duration(mean)} active / occurrence</span><span>Last match {w.matchedBy === 'jev' ? `Jev ${Math.round(w.score * 100)}%` : `local ${Math.round(w.score * 100)} / 100`}</span></div>
             <p className="muted">Timing is approximate. Jev match percentages are calibrated probabilities; local scores are not. Evidence spans {occurrences.length ? Math.max(0, (Math.max(...occurrences.map(e => e.end)) - Math.min(...occurrences.map(e => e.start))) / 86400000).toFixed(2) : '0'} days. No weekly projection.</p>
             {w.interpretation && <div className="interpretation"><p>{w.interpretation.result.purpose}</p><p className="note">Interpretation v{w.interpretation.version} · based on {w.interpretation.occurrenceCount} occurrences, feedback v{w.interpretation.feedbackVersion}. {(w.interpretation.occurrenceCount !== occurrences.length || w.interpretation.feedbackVersion !== w.feedbackVersion) ? 'OUTDATED — new evidence/corrections need fresh approval.' : 'Inferred business intent requires your review.'}</p>
@@ -203,8 +219,8 @@ function App() {
               <p className="muted">Corrections apply only to this group and future matched occurrences. They invalidate existing drafts to avoid silently overwriting edits.</p>
             </div>
             {jobs.slice(0, 2).map(j => <p className={`job ${j.state === 'failed' ? 'failed' : ''}`} key={j.id}>{j.kind === 'analysis' ? 'Interpretation' : 'Definition'} · {j.state}{j.error && ` — ${j.error}`}</p>)}
-            <div className="row wrap"><button className="primary" disabled={busy || active || suppressed || occurrences.length < 3} onClick={() => run(() => openShare(w, 'analysis'))}>Review & analyze</button><button disabled={busy || !occurrences.length} onClick={() => run(async () => { await command({ type: 'draft.manual', workflowId: w.id }); setTab('Agent drafts'); })}>Local manual draft</button></div>
-            <div className="row wrap"><button disabled={busy || active || suppressed || !w.interpretation} onClick={() => run(() => openShare(w, 'definition'))}>Review AI draft request</button><button className="textbutton" disabled={busy} onClick={() => run(() => feedback(w, w.dismissedAtCount !== null ? 'restore' : 'dismiss'))}>{w.dismissedAtCount !== null ? 'Restore recommendation' : 'Dismiss'}</button></div>
+            <div className="row wrap"><button className="primary" disabled={busy || active || suppressed || occurrences.length < 1} onClick={() => run(() => openShare(w, 'analysis'))}>Name & explain with OpenAI</button><button disabled={busy || !occurrences.length} onClick={() => run(async () => { await command({ type: 'draft.manual', workflowId: w.id }); setTab('Agent drafts'); })}>Local manual draft</button></div>
+            <div className="row wrap"><button disabled={busy || active || suppressed || !w.interpretation} onClick={() => run(() => openShare(w, 'definition'))}>Review AI draft request</button><button className="textbutton" disabled={busy} onClick={() => run(() => feedback(w, w.dismissedAtCount !== null ? 'restore' : 'dismiss'))}>{w.dismissedAtCount !== null ? 'Restore recommendation' : 'Dismiss'}</button>{occurrences.length === 1 && <button className="textbutton" disabled={busy} onClick={() => send({ type: 'workflow.pin', workflowId: w.id, pinned: !w.pinned })}>{w.pinned ? 'Unpin' : 'Pin (keep without repeats)'}</button>}</div>
             {suppressed && <p className="muted">Suppressed until restored or three additional occurrences are recorded.</p>}
           </section>;
         })}

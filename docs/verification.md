@@ -24,6 +24,13 @@
   - match: invoice episode against [support, invoice] → the invoice pattern at 1.0; support episode against [invoice] → new task at 0.99.
 - Synthetic API checks only; the extension hasn't yet made these calls from Chrome, and thresholds aren't tuned on real use.
 
+### Always-on discovery update (2026-10-12)
+
+- `npm run typecheck` and `npm run build`: passed.
+- `npm run jev:eval` against live Jev: **49/49** synthetic cases passed (25,096 input tokens). Route templates 5/5, value sources 3/3, site screening 12/12, actions 8/8, triage 8/8, boundaries 4/4, relevance/outcome 5/5, matching 4/4.
+- Weak margins: "ticket vs [invoice]" chose new task at 58%; "Submit for approval" → save at 69%; shopping scored routine 58% (discarded on work 15%). The `automatable` score was 85–92% for every case, including social scrolling, so it is displayed but not used for decisions.
+- **Not done:** any of this in Chrome. The previous Chrome checklist is still entirely pending.
+
 Initial typechecking exposed incorrect relative imports; those were fixed before the successful builds. Node 22's `node:sqlite` experimental warning is expected. No automated tests were added or executed, by explicit owner request.
 
 ## Not performed — do not call these passed
@@ -74,6 +81,16 @@ Use the synthetic pages and instructions in `demo.md`.
 - [ ] Jev off in Settings, backend stopped, or no key: capture continues, the status explains why, and grouping falls back to `local`.
 - [ ] Pause during an in-flight Jev call: the event is not stored.
 - [ ] Captured content in the OpenAI sharing preview can be redacted; factual fields cannot.
+- [ ] **Record on all websites** requests one grant; recording starts on any ordinary site without approving it; the badge reads `TXT`.
+- [ ] Locally listed sites (e.g. a `.gov` or bank domain) are `SKIP` before any capture; a Jev-sensitive site is skipped and its stored data purged.
+- [ ] Block/Unblock a discovered site; blocking purges its data.
+- [ ] An episode closes automatically after a clearly finished task (Jev ≥ 0.8) or idle; **End episode** is optional.
+- [ ] A finished routine task appears in Patterns as *Candidate · seen once*; a casual browsing episode is discarded and the discard count increases; its events and text are gone from IndexedDB.
+- [ ] A repeat joins the candidate, which becomes *Pattern · repeated*.
+- [ ] Unpinned single candidates expire after 7 days; pinned ones stay.
+- [ ] Timeline shows element names and ID-free routes; no query strings or IDs appear in stored routes.
+- [ ] Field edits copied from page text are marked `copied`; the snapshot after a save is linked as its outcome with a success probability.
+- [ ] Turning off page-text capture stops content records immediately; text captured under the old setting is never committed.
 
 ## Known MVP constraints
 

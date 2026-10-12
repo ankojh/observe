@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import { Action } from '../../../packages/core/src/schemas';
-import { JevDecision, type JevRequest } from '../../../packages/core/src/jev';
+import { Action, PageType } from '../../../packages/core/src/schemas';
+import { JevDecision, SENSITIVE_SITE_CATEGORIES, SiteCategory, type JevRequest } from '../../../packages/core/src/jev';
 
 const ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
 type Question =
@@ -31,6 +31,33 @@ const ACTION_CRITERIA: Record<z.infer<typeof Action>, string> = {
   unknown: 'None of the above, or the label does not make the action clear',
 };
 
+const PAGE_CRITERIA: Record<z.infer<typeof PageType>, string> = {
+  list_or_queue: 'A list, table, or queue of items to work through',
+  record_detail: 'The details of one record, item, ticket, order, or invoice',
+  form_or_editor: 'A form or editor for creating or changing something',
+  search_results: 'Search or filter results',
+  inbox_or_messages: 'An inbox, chat, or message thread',
+  compose_message: 'Composing or replying to a message',
+  dashboard: 'A dashboard or overview with summaries or charts',
+  settings: 'Settings, preferences, or administration',
+  document: 'An article, document, or long-form reading page',
+  other: 'None of the above',
+};
+const SITE_CRITERIA: Record<SiteCategory, string> = {
+  work_tool: 'Business software: CRM, ticketing, invoicing, project management, docs, spreadsheets, admin consoles',
+  email: 'Webmail',
+  shopping: 'Online shopping or marketplaces',
+  news_media: 'News, blogs, video, or entertainment',
+  social: 'Social networks or forums',
+  banking_finance: 'Banking, payments, investing, crypto, tax, or personal finance accounts',
+  healthcare: 'Healthcare providers, patient portals, insurance, or pharmacies',
+  government: 'Government services',
+  password_or_identity: 'Login, single sign-on, password managers, or identity verification',
+  hr_payroll: 'HR, payroll, or benefits',
+  adult: 'Adult content',
+  other: 'Anything else',
+};
+
 /** Fixed question templates. The extension sends only typed state; it cannot author questions. */
 export function questionsFor(req: JevRequest): { state: unknown; questions: Record<string, Question> } {
   switch (req.kind) {
@@ -41,8 +68,22 @@ export function questionsFor(req: JevRequest): { state: unknown; questions: Reco
     case 'relevance': return {
       state: { content: req.content, recentActivity: req.recent },
       questions: {
+        pageType: { type: 'choice', instructions: 'What kind of page or view does `content` come from?', criteria: PAGE_CRITERIA },
+        ...(req.outcomeCheck ? { succeeded: { type: 'noul' as const, instructions: 'The user just submitted or saved something, and `content` is what the page showed next. Does it indicate success (a confirmation, a saved, sent, or updated state) rather than an error or validation problem?' } } : {}),
         relevant: { type: 'noul', instructions: 'Is `content` part of the work the user is doing, such as the record, message, form, or data they are reading or editing?', criteria: { true: 'Task material the user is working with', false: 'Site navigation, menus, ads, cookie or consent banners, footers, or other boilerplate' } },
         sensitive: { type: 'noul', instructions: 'Does `content` contain passwords, secrets, access tokens, government ID numbers, full payment card or bank account numbers, or medical information about a person?' },
+      },
+    };
+    case 'site': return {
+      state: { hostname: req.hostname, pageTitle: req.title },
+      questions: { category: { type: 'choice', instructions: 'What kind of website is this, judging by its `hostname` and `pageTitle`?', criteria: SITE_CRITERIA } },
+    };
+    case 'triage': return {
+      state: req.episode,
+      questions: {
+        work: { type: 'noul', instructions: 'Do `actions` and `content` show the user doing productive work, such as processing a record, communicating with someone, entering data, or researching for a task?', criteria: { true: 'Productive work', false: 'Casual browsing, reading for leisure, shopping, entertainment, or idle navigation' } },
+        routine: { type: 'noul', instructions: 'Does this look like a routine procedure that someone would repeat many times with different records or data, rather than a one-off activity?' },
+        automatable: { type: 'noul', instructions: 'Could a software agent plausibly carry out these steps, given the same inputs and access, with a human approving the result?' },
       },
     };
     case 'boundary': return {
@@ -67,7 +108,16 @@ export function decode(req: JevRequest, model: string, answers: Record<string, u
       const a = ChoiceAnswer.parse(answers.action); const action = Action.parse(a.choice);
       return JevDecision.parse({ kind: 'action', action, probability: a.probabilities[a.choice] ?? 0, model });
     }
-    case 'relevance': return JevDecision.parse({ kind: 'relevance', relevant: NoulAnswer.parse(answers.relevant).noul, sensitive: NoulAnswer.parse(answers.sensitive).noul, model });
+    case 'relevance': return JevDecision.parse({
+      kind: 'relevance', relevant: NoulAnswer.parse(answers.relevant).noul, sensitive: NoulAnswer.parse(answers.sensitive).noul,
+      pageType: PageType.parse(ChoiceAnswer.parse(answers.pageType).choice), succeeded: req.outcomeCheck ? NoulAnswer.parse(answers.succeeded).noul : null, model,
+    });
+    case 'site': {
+      const a = ChoiceAnswer.parse(answers.category);
+      const sensitive = Math.min(1, SENSITIVE_SITE_CATEGORIES.reduce((n, c) => n + (a.probabilities[c] ?? 0), 0));
+      return JevDecision.parse({ kind: 'site', category: SiteCategory.parse(a.choice), sensitive, model });
+    }
+    case 'triage': return JevDecision.parse({ kind: 'triage', work: NoulAnswer.parse(answers.work).noul, routine: NoulAnswer.parse(answers.routine).noul, automatable: NoulAnswer.parse(answers.automatable).noul, model });
     case 'boundary': return JevDecision.parse({ kind: 'boundary', finished: NoulAnswer.parse(answers.finished).noul, model });
     case 'match': {
       const a = ChoiceAnswer.parse(answers.match); const index = /^pattern_(\d+)$/.exec(a.choice);

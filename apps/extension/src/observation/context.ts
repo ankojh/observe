@@ -1,7 +1,7 @@
 import { CONTENT_LIMITS, redactContent } from '../../../../packages/core/src/privacy';
 import type { ContentData } from '../../../../packages/core/src/schemas';
 
-type Session = { id: string; expiresAt: number };
+type Session = { id: string };
 type Field = HTMLInputElement | HTMLTextAreaElement | HTMLElement;
 const protectedPurpose = /password|passwd|secret|token|api[ _-]?key|credit|card|cvv|cvc|iban|bank|routing|social.security|\bssn\b|one[ _-]?time|\botp\b|\bpin\b|payment|login|sign[ _-]?in|username/i;
 function visible(el: Element): boolean {
@@ -59,12 +59,10 @@ function viewportExcerpt(): { text: string; truncated: boolean } {
 export function createContextCapture(send: (data: ContentData, sessionId: string) => Promise<void>) {
   let session: Session | null = null, lastText = '', lastAt = 0;
   let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
-  let expiryTimer: ReturnType<typeof setTimeout> | undefined;
   let observer: MutationObserver | undefined;
-  let banner: HTMLElement | undefined;
   const fields = new Map<Field, { before: string | null; dirty: boolean; type: ContentData['fieldType']; timer?: ReturnType<typeof setTimeout>; composing: boolean }>();
   const pending = new Set<Promise<void>>();
-  const active = () => !!session && session.expiresAt > Date.now() && !document.hidden;
+  const active = () => !!session && !document.hidden;
   function track(data: ContentData) {
     if (!active()) return Promise.resolve();
     const promise = send(data, session!.id).catch(() => {}).finally(() => pending.delete(promise));
@@ -98,18 +96,9 @@ export function createContextCapture(send: (data: ContentData, sessionId: string
   function stop() {
     session = null; lastText = ''; lastAt = 0;
     if (snapshotTimer) clearTimeout(snapshotTimer);
-    if (expiryTimer) clearTimeout(expiryTimer);
     observer?.disconnect(); observer = undefined;
     for (const entry of fields.values()) if (entry.timer) clearTimeout(entry.timer);
-    fields.clear(); banner?.remove(); banner = undefined;
-  }
-  function showBanner() {
-    banner = document.createElement('div');
-    const shadow = banner.attachShadow({ mode: 'closed' });
-    const badge = document.createElement('div');
-    badge.textContent = '◉ Observe · CONTENT RECORDING · local / 24h';
-    badge.style.cssText = 'position:fixed;top:8px;right:8px;z-index:2147483647;padding:7px 12px;border-radius:7px;background:#176b58;color:white;font:11px system-ui;box-shadow:0 1px 7px #0003;pointer-events:none';
-    shadow.append(badge); document.documentElement.append(banner);
+    fields.clear();
   }
   document.addEventListener('focusin', event => {
     if (!active() || !event.isTrusted) return;
@@ -145,12 +134,12 @@ export function createContextCapture(send: (data: ContentData, sessionId: string
   });
   return {
     configure(next: Session | null) {
-      if (!next || next.expiresAt <= Date.now()) { stop(); return; }
-      if (session?.id === next.id) { session = next; return; }
-      stop(); session = next; showBanner();
+      // Always on while the worker allows it; the toolbar badge shows capture state.
+      if (!next) { stop(); return; }
+      if (session?.id === next.id) return;
+      stop(); session = next;
       observer = new MutationObserver(schedule);
       if (document.body) observer.observe(document.body, { subtree: true, childList: true, characterData: true });
-      expiryTimer = setTimeout(stop, Math.max(0, next.expiresAt - Date.now()));
       schedule();
     },
     async flush() {

@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "backend": "tsx --env-file-if-exists=apps/backend/.env apps/backend/src/index.ts",
     "dev:extension": "vite --config apps/extension/vite.config.ts",
-    "package": "npm run build && rm -f observe-extension.zip && cd apps/extension/dist && zip -r ../../../observe-extension.zip ."
+    "package": "npm run build && rm -f observe-extension.zip && cd apps/extension/dist && zip -r ../../../observe-extension.zip .",
+    "jev:eval": "tsx --env-file-if-exists=apps/backend/.env scripts/jev-eval.ts"
   },
   "dependencies": {
     "dexie": "^4.0.11",

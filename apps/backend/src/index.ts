@@ -129,7 +129,7 @@ app.post(['/analysis-jobs', '/definition-jobs'], (req, res) => {
   if (!payload.success) { res.status(400).json({ error: 'Invalid summary or definition input' }); return; }
   const summary = 'summary' in payload.data ? payload.data.summary : payload.data;
   const refs = new Set(summary.occurrences.map(o => o.ref));
-  if (refs.size !== summary.occurrences.length || summary.occurrenceCount < summary.occurrences.length || (kind === 'analysis' && summary.occurrenceCount < 3) || summary.occurrences.some(o => o.actions.some(a => !summary.apps.some(app => app.ref === a.app)))) {
+  if (refs.size !== summary.occurrences.length || summary.occurrenceCount < summary.occurrences.length || summary.occurrences.some(o => o.actions.some(a => !summary.apps.some(app => app.ref === a.app)))) {
     res.status(400).json({ error: 'Invalid or insufficient occurrence evidence' }); return;
   }
   const digest = createHash('sha256').update(JSON.stringify({ kind, payload: payload.data })).digest('hex');

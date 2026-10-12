@@ -20,24 +20,35 @@ export const ContentPayload = z.object({
   epoch: z.number().int().nonnegative(), visible: z.boolean(), sessionId: z.string().uuid(), data: ContentData,
 }).strict();
 export type ContentPayload = z.infer<typeof ContentPayload>;
-export type ContentRecord = ContentData & { id: string; time: number; siteId: string; episodeId: string; document: string; sessionId: string; relevance?: number | null };
+export const PageType = z.enum(['list_or_queue', 'record_detail', 'form_or_editor', 'search_results', 'inbox_or_messages', 'compose_message', 'dashboard', 'settings', 'document', 'other']);
+export type PageType = z.infer<typeof PageType>;
+/** Where a field value came from, for turning recordings into reusable templates with inputs. */
+export type ValueSource = { source: 'copied' | 'derived' | 'typed'; ref?: string };
+export type ContentRecord = ContentData & {
+  id: string; time: number; siteId: string; episodeId: string; document: string; sessionId: string; relevance?: number | null;
+  pageType?: PageType | null; provenance?: ValueSource; outcomeOf?: string; outcome?: number | null;
+};
 export type ContentFeature = { app: string; kind: ContentData['kind']; label: string; terms: string[]; fieldType: ContentData['fieldType'] };
 export const EventPayload = z.object({
   id: z.string().uuid(), document: z.string().uuid(), sequence: z.number().int().nonnegative(),
   epoch: z.number().int().nonnegative(), category: BasicCategory,
   action: Action, role: z.enum(['page', 'button', 'link', 'form', 'unknown']), visible: z.boolean(),
-  // Transient control label for Jev classification of unknown actions. Redacted in the worker and never stored.
+  // Accessible name of the activated control. Redacted in the worker and stored as `target`.
   hint: z.string().max(120).optional(),
+  // Page route with IDs replaced by :id, no query string. Sent on page.enter and route changes.
+  route: z.string().max(200).optional(),
 }).strict();
 export type EventPayload = z.infer<typeof EventPayload>;
-export type ObservedEvent = Omit<EventPayload, 'category' | 'hint'> & { category: z.infer<typeof Category>; time: number; siteId: string; tabId: number; contextRef?: string };
+export type ObservedEvent = Omit<EventPayload, 'category' | 'hint' | 'route'> & { category: z.infer<typeof Category>; time: number; siteId: string; tabId: number; contextRef?: string; target?: string; route?: string };
 export type Episode = {
   id: string; eventIds: string[]; tokens: string[]; start: number; end: number;
   activeMs: number; closed: boolean; reason: string; gaps: string[]; timingBreak?: boolean; contentFeatures?: ContentFeature[];
   // Closed episodes await asynchronous Jev/local grouping. Undefined on legacy rows means already grouped.
   grouping?: 'pending' | 'done';
   boundarySuggestion?: { probability: number; eventCount: number; time: number };
+  triage?: Triage;
 };
+export type Triage = { work: number; routine: number; automatable: number; by: 'jev' | 'local' };
 export type Feedback = {
   id: string; workflowId: string; version: number; time: number;
   type: 'intent' | 'rule' | 'dismiss' | 'restore' | 'exclude'; text: string; episodeId?: string; supersedes?: string;
@@ -46,6 +57,8 @@ export type Workflow = {
   id: string; representativeId: string; occurrenceIds: string[]; excludedIds: string[];
   score: number; feedbackVersion: number; dismissedAtCount: number | null;
   matchedBy?: 'jev' | 'local';
+  pinned?: boolean;
+  candidate?: Triage;
   interpretation?: { version: number; time: number; result: Interpretation; payloadHash: string; feedbackVersion: number; occurrenceCount: number };
   interpretationHistory?: Array<NonNullable<Workflow['interpretation']>>;
 };
@@ -69,7 +82,7 @@ export const WorkflowSummary = z.object({
   schemaVersion: z.enum(['1.0', '2.0']), workflowId: id,
   apps: z.array(z.object({ ref: id, alias: z.string().min(1).max(80) }).strict()).min(1).max(20),
   occurrences: z.array(z.object({
-    ref: id, actions: z.array(z.object({ app: id, category: Category, action: Action }).strict()).min(1).max(120),
+    ref: id, actions: z.array(z.object({ app: id, category: Category, action: Action, target: z.string().max(80).optional(), page: z.string().max(200).optional() }).strict()).min(1).max(120),
     approximateActiveMs: z.number().nonnegative().max(86400000),
     content: z.array(ContentEvidence).max(6).default([]),
   }).strict()).min(1).max(20),

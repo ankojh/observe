@@ -1,5 +1,6 @@
 import { ContentPayload, EventPayload, type EventPayload as Payload } from '../../../../packages/core/src/schemas';
 import { createContextCapture } from './context';
+import { routeTemplate } from '../../../../packages/core/src/privacy';
 
 // Isolated-world singleton. Dynamic registration + injection must not duplicate listeners.
 const marker = '__observeCaptureV2';
@@ -37,17 +38,17 @@ if (!globals[marker] && window.top === window) {
     if (label.length > 24) return 'unknown';
     return Object.hasOwn(allowed, label.trim().toLowerCase()) ? allowed[label.trim().toLowerCase()] : 'unknown';
   }
-  /** Short accessible name of a non-editable control, sent only for Jev classification of unknown actions. */
+  /** Short accessible name of a non-editable control. Stored (redacted) as the event target and used by Jev for unknown actions. */
   function hintFor(el: Element): string | undefined {
     if (el.querySelector('input,textarea,select,[contenteditable]:not([contenteditable="false"])')) return;
     const raw = el.getAttribute('aria-label') ?? el.getAttribute('title') ?? (el.textContent ?? '').slice(0, 400);
     const text = raw.replace(/\s+/g, ' ').trim().slice(0, 120);
     return text || undefined;
   }
-  async function emit(category: Payload['category'], action: Payload['action'] = 'unknown', role: Payload['role'] = 'page', hint?: string) {
+  async function emit(category: Payload['category'], action: Payload['action'] = 'unknown', role: Payload['role'] = 'page', hint?: string, route?: string) {
     if (!enabled || (document.hidden && category !== 'page.visibility_change')) return;
     if (inFlight >= 8) { void chrome.runtime.sendMessage({ type: 'capture.gap', epoch }).catch(() => {}); return; }
-    const payload = EventPayload.parse({ id: crypto.randomUUID(), document: documentId, sequence: sequence++, epoch, category, action, role, visible: !document.hidden, ...(hint ? { hint } : {}) });
+    const payload = EventPayload.parse({ id: crypto.randomUUID(), document: documentId, sequence: sequence++, epoch, category, action, role, visible: !document.hidden, ...(hint ? { hint } : {}), ...(route ? { route } : {}) });
     inFlight++;
     try {
       // One idempotent retry only while the same epoch is still enabled. No offline backlog.
@@ -63,9 +64,9 @@ if (!globals[marker] && window.top === window) {
   function checkRoute() {
     if (!enabled || document.hidden) return;
     const next = location.href; // transient only; no URL hashes, routes, or titles persisted.
-    if (next !== lastLocation) { lastLocation = next; void emit('page.route_change'); context.route(); }
+    if (next !== lastLocation) { lastLocation = next; void emit('page.route_change', 'unknown', 'page', undefined, routeTemplate(location.pathname, location.hash)); context.route(); }
   }
-  function configure(config: { enabled?: boolean; epoch?: number; content?: { id: string; expiresAt: number } | null }) {
+  function configure(config: { enabled?: boolean; epoch?: number; content?: { id: string } | null }) {
     if ((config.epoch ?? -1) < epoch) return; // An old hello response cannot undo a newer consent broadcast.
     const wasEnabled = enabled;
     const previousEpoch = epoch;
@@ -75,7 +76,7 @@ if (!globals[marker] && window.top === window) {
     if (!enabled) lastLocation = '';
     if (enabled && !document.hidden) poll = setInterval(checkRoute, 1000);
     context.configure(enabled ? config.content ?? null : null);
-    if (enabled && (!wasEnabled || previousEpoch !== epoch)) { lastLocation = location.href; void emit('page.enter'); }
+    if (enabled && (!wasEnabled || previousEpoch !== epoch)) { lastLocation = location.href; void emit('page.enter', 'unknown', 'page', undefined, routeTemplate(location.pathname, location.hash)); }
   }
   chrome.runtime.onMessage.addListener((message, _sender, reply) => {
     if (message?.type === 'capture.config') configure(message);
@@ -87,7 +88,7 @@ if (!globals[marker] && window.top === window) {
     const el = event.target.closest('button,a,[role="button"],[role="link"]');
     if (!el || editable(el)) return;
     const action = classify(el);
-    void emit('control.activate', action, el.matches('a,[role="link"]') ? 'link' : 'button', action === 'unknown' ? hintFor(el) : undefined);
+    void emit('control.activate', action, el.matches('a,[role="link"]') ? 'link' : 'button', hintFor(el));
   }, true);
   document.addEventListener('submit', event => {
     if (enabled && event.isTrusted) void emit('form.submit_attempt', 'unknown', 'form');
@@ -100,5 +101,6 @@ if (!globals[marker] && window.top === window) {
   });
   window.addEventListener('popstate', checkRoute);
   window.addEventListener('hashchange', checkRoute);
-  void chrome.runtime.sendMessage({ type: 'capture.hello' }).then(configure).catch(() => configure({ enabled: false }));
+  // The title is used only for the sensitive-site check and is not stored.
+  void chrome.runtime.sendMessage({ type: 'capture.hello', title: document.title.slice(0, 120) }).then(configure).catch(() => configure({ enabled: false }));
 }

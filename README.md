@@ -1,6 +1,6 @@
 # Observe
 
-A **Chrome Manifest V3 extension** for privacy-minimized workflow discovery. Record safe categories on explicitly approved sites (plus page text and field edits in opt-in content-aware sessions), let TypeSafe's **Jev** make live decisions about actions, relevance, task boundaries, and which episodes are the same task, review a minimized summary before sharing with OpenAI, correct its interpretation, and export an editable **non-executable** agent definition.
+A **Chrome Manifest V3 extension** for automatic workflow discovery. After one grant it records in the background on all websites except sensitive ones (banking, health, government, login, HR, adult), including page text and field edits. TypeSafe's **Jev** ends finished tasks, keeps only episodes that look like routine work (deleting the rest), and matches repeats, review a minimized summary before sharing with OpenAI, correct its interpretation, and export an editable **non-executable** agent definition.
 
 This is a buildable MVP implementation, not a claim of verified browser or live-provider acceptance. Automated tests were intentionally deferred at the owner's request. There is no mock AI, agent execution, replay, CREAO integration, or cloud event-stream storage.
 
@@ -17,10 +17,9 @@ npm run build
 1. Open `chrome://extensions` and enable **Developer mode**.
 2. Click **Load unpacked** and select `/Users/ankojh/b12/observe/apps/extension/dist`.
 3. Click the Observe toolbar action to open its **side panel**. Pin it if desired.
-4. Navigate to an ordinary HTTP(S) site. Click **Approve this scheme & host**, then **Start**.
-5. Inspect the real timeline. Mark each task complete using **End episode**.
-6. Optionally start a one-hour **content-aware session** for selected sites to capture visible text and field edits.
-7. Repeat related sequences; three distinct completed occurrences enable **Review & analyze**.
+4. Click **Record on all websites** (or approve only the current site).
+5. Work normally. Episodes end automatically; **End episode** is optional. Each finished episode is kept as a candidate or discarded.
+6. In **Patterns**, candidates appear after one pass and become patterns when repeated. **Name & explain with OpenAI** is available from one occurrence.
 
 No capture is enabled on first install. Optional HTTP(S) capability is not blanket access. Chrome grants a scheme/host across paths/ports; Observe additionally checks an exact approved origin (including port). No subdomain wildcard is requested.
 
@@ -51,7 +50,9 @@ The provider decision is **OpenAI**; the backend decision is **loopback-only**. 
 
 ### Jev live decisions
 
-Add `TYPESAFE_API_KEY` and a positive `JEV_MAX_DAILY_TOKENS` to `apps/backend/.env` (optionally `JEV_MODEL`, default `jev-latest`) and restart the backend. Settings → *Backend pairing* then shows *Jev ready*. While recording, minimized and redacted data is sent to Jev automatically, without per-request approval; turn this off in Settings. Without Jev, the original local rules decide. See [privacy](docs/privacy.md#jev-live-decisions-typesafe).
+Add `TYPESAFE_API_KEY` and a positive `JEV_MAX_DAILY_TOKENS` to `apps/backend/.env` (optionally `JEV_MODEL`, default `jev-latest`) and restart the backend. Always-on recording uses roughly 0.5–1M input tokens per active hour, so set the cap to at least `20000000` (about $0.84/day at list price). Settings → *Backend pairing* then shows *Jev ready*. While recording, minimized and redacted data is sent to Jev automatically, without per-request approval; turn this off in Settings. Without Jev, local rules keep every meaningful episode.
+
+`npm run jev:eval` replays synthetic fixtures (`scripts/jev-fixtures.ts`) against live Jev with the extension's thresholds and prints per-decision results; use it when changing questions or thresholds. See [privacy](docs/privacy.md#jev-live-decisions-typesafe).
 
 Cost guards reserve a conservative estimate using UTF-8 input bytes plus schema/protocol headroom and the output token cap. They are local guards, **not an invoice guarantee**; correct model prices and provider-side account limits are still required. There are no automatic charged provider retries.
 
