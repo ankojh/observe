@@ -1,0 +1,37 @@
+{
+  "name": "observe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Privacy-minimized browser workflow discovery and portable agent drafts",
+  "scripts": {
+    "build": "npm run typecheck && node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "backend": "tsx --env-file-if-exists=apps/backend/.env apps/backend/src/index.ts",
+    "dev:extension": "vite --config apps/extension/vite.config.ts",
+    "package": "npm run build && rm -f observe-extension.zip && cd apps/extension/dist && zip -r ../../../observe-extension.zip ."
+  },
+  "dependencies": {
+    "dexie": "^4.0.11",
+    "express": "^5.1.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "zod": "^3.25.76",
+    "zod-to-json-schema": "^3.25.2"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.24",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.18.0",
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^4.7.0",
+    "esbuild": "^0.25.9",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vite": "^6.3.6"
+  },
+  "engines": {
+    "node": ">=22.21.0"
+  }
+}

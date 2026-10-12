@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Observe — Workflow Discovery",
+  "version": "0.1.0",
+  "description": "Observe approved sites locally, review recurring patterns, and export non-executable agent definitions.",
+  "minimum_chrome_version": "120",
+  "permissions": ["sidePanel", "storage", "scripting", "activeTab"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "Open Observe" },
+  "side_panel": { "default_path": "index.html" },
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' http://127.0.0.1:4317" }
+}

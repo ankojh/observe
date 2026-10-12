@@ -1,0 +1,7 @@
+node_modules/
+apps/extension/dist/
+apps/backend/.env
+apps/backend/data/
+*.zip
+*.log
+.DS_Store
